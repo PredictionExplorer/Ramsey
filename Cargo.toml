@@ -4,6 +4,7 @@ version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.92.0"
 description  = "High-performance Ramsey number search engine for R(C4, K_n)"
+repository   = "https://github.com/PredictionExplorer/Ramsey"
 license      = "MIT"
 keywords     = ["ramsey", "graph-theory", "combinatorics", "optimization"]
 categories   = ["algorithms", "mathematics"]

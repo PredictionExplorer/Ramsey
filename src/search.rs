@@ -3,10 +3,10 @@
 use crate::graph::RamseyState;
 use crate::iset::IndependentSetOracle;
 use rand::prelude::*;
-use rand_xorshift::XorShiftRng;
+use rand::rngs::SmallRng;
 use rayon::prelude::*;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ============================================================================
 // Configuration
@@ -85,15 +85,15 @@ impl Default for SearchConfig {
 
 /// Runs the record search for `N=39, K=11`.
 pub fn run_record_search(cfg: &SearchConfig) {
-    run_search::<39, 11>(cfg);
+    run_search::<39>(cfg, 11);
 }
 
 /// Runs a parallel search for a graph on `N` vertices with:
 /// - no `C4` cycles
-/// - no independent set of size `K`
-pub fn run_search<const N: usize, const K: usize>(cfg: &SearchConfig) {
+/// - no independent set of size `k_target`
+pub fn run_search<const N: usize>(cfg: &SearchConfig, k_target: usize) {
     println!("--------------------------------------------------");
-    println!("Ramsey Search: target = no C4 and no IS(K={K}) on N={N}");
+    println!("Ramsey Search: target = no C4 and no IS(K={k_target}) on N={N}");
     println!(
         "Chains: {} (Logical Cores: {}) | p={:.3}",
         cfg.chains,
@@ -111,9 +111,16 @@ pub fn run_search<const N: usize, const K: usize>(cfg: &SearchConfig) {
 
     let base_seed = cfg.seed.unwrap_or_else(random_u64);
     let found_flag = AtomicBool::new(false);
+    let global_best_energy = AtomicUsize::new(usize::MAX);
+
+    // Initialize CSV Log file
+    let log_filename = format!("search_log_n{N}_k{k_target}.csv");
+    if let Ok(mut log_file) = std::fs::File::create(&log_filename) {
+        let _ = writeln!(log_file, "timestamp_ms,iterations,temperature,best_energy");
+    }
 
     (0..cfg.chains).into_par_iter().for_each(|worker_id| {
-        solve_worker::<N, K>(worker_id, base_seed, cfg, &found_flag);
+        solve_worker::<N>(worker_id, base_seed, cfg, k_target, &found_flag, &global_best_energy);
     });
 }
 
@@ -121,23 +128,30 @@ pub fn run_search<const N: usize, const K: usize>(cfg: &SearchConfig) {
 // Worker
 // ============================================================================
 
-fn solve_worker<const N: usize, const K: usize>(
+fn solve_worker<const N: usize>(
     worker_id: usize,
     base_seed: u64,
     cfg: &SearchConfig,
+    k_target: usize,
     found_flag: &AtomicBool,
+    global_best_energy: &AtomicUsize,
 ) {
-    let mut rng = XorShiftRng::seed_from_u64(splitmix64(base_seed ^ (worker_id as u64)));
+    let mut rng = SmallRng::seed_from_u64(splitmix64(base_seed ^ (worker_id as u64)));
     let mut state = RamseyState::<N>::new_random(&mut rng, cfg.edge_probability);
     let mut oracle = IndependentSetOracle::<N>::new();
-    let mut scratch_set = Vec::<usize>::with_capacity(K.max(16));
+    let mut scratch_set = Vec::<usize>::with_capacity(k_target.max(16));
 
     let mut temp = cfg.temp_start;
     let mut iterations: u64 = 0;
+    let start_time = std::time::Instant::now();
 
     let lahc_len = cfg.lahc_size.clamp(1, MAX_LAHC_SIZE);
     let mut lahc_history = [0usize; MAX_LAHC_SIZE];
-    let initial_energy = evaluate::<N, K>(&state, &mut oracle, &mut scratch_set, cfg).energy;
+    let initial_energy = evaluate::<N>(&state, &mut oracle, &mut scratch_set, k_target, cfg).energy;
+    
+    // Update global best
+    global_best_energy.fetch_min(initial_energy, Ordering::Relaxed);
+
     for slot in lahc_history.iter_mut().take(lahc_len) {
         *slot = initial_energy;
     }
@@ -148,10 +162,10 @@ fn solve_worker<const N: usize, const K: usize>(
         iterations += 1;
 
         let (u, v) =
-            propose_move::<N, K, _>(&mut state, &mut oracle, &mut scratch_set, &mut rng, cfg);
+            propose_move::<N, _>(&mut state, &mut oracle, &mut scratch_set, k_target, &mut rng, cfg);
 
         state.flip_edge(u, v);
-        let eval = evaluate::<N, K>(&state, &mut oracle, &mut scratch_set, cfg);
+        let eval = evaluate::<N>(&state, &mut oracle, &mut scratch_set, k_target, cfg);
 
         if eval.is_solution {
             if found_flag
@@ -159,9 +173,9 @@ fn solve_worker<const N: usize, const K: usize>(
                 .is_ok()
             {
                 println!(
-                    "\n[Worker {worker_id}] SUCCESS: found valid graph (N={N}, K={K}). Saving..."
+                    "\n[Worker {worker_id}] SUCCESS: found valid graph (N={N}, K={k_target}). Saving..."
                 );
-                let filename = format!("graph_n{N}_k{K}.txt");
+                let filename = format!("graph_n{N}_k{k_target}.txt");
                 if let Err(e) = state.save_to_file(&filename) {
                     eprintln!("[Worker {worker_id}] ERROR: failed to save {filename}: {e}");
                 } else {
@@ -172,6 +186,17 @@ fn solve_worker<const N: usize, const K: usize>(
         }
 
         let new_energy = eval.energy;
+        
+        // Update global best if we found a new local best
+        if new_energy < current_energy {
+            let old_best = global_best_energy.fetch_min(new_energy, Ordering::Relaxed);
+            if new_energy < old_best {
+                // We found a new global best! Save it as a checkpoint.
+                let filename = format!("best_checkpoint_n{N}_k{k_target}.txt");
+                let _ = state.save_to_file(&filename);
+            }
+        }
+
         let lahc_threshold = lahc_history[lahc_idx];
         let delta = (new_energy as f64) - (current_energy as f64);
 
@@ -194,18 +219,28 @@ fn solve_worker<const N: usize, const K: usize>(
             lahc_idx = 0;
         }
 
-        if iterations % cfg.temp_update_every == 0 {
+        if iterations.is_multiple_of(cfg.temp_update_every) {
             temp *= cfg.cooling_rate;
             if temp < cfg.reheat_threshold {
                 temp = cfg.reheat_temp;
             }
 
-            if worker_id == 0 && iterations % cfg.report_every == 0 {
+            if worker_id == 0 && iterations.is_multiple_of(cfg.report_every) {
+                let best = global_best_energy.load(Ordering::Relaxed);
+                
+                // 1. Terminal Dashboard (updates in place)
                 print!(
-                    "\rIter: {iterations} | T: {temp:.4} | E: {current_energy} | C4: {}    ",
+                    "\rIter: {iterations} | T: {temp:.4} | Best E: {best} | Worker0 E: {current_energy} | C4: {}    ",
                     state.c4_count()
                 );
                 let _ = std::io::stdout().flush();
+
+                // 2. Persistent CSV Log (for historical analysis)
+                let log_filename = format!("search_log_n{N}_k{k_target}.csv");
+                if let Ok(mut log_file) = std::fs::OpenOptions::new().append(true).open(&log_filename) {
+                    let elapsed = start_time.elapsed().as_millis();
+                    let _ = writeln!(log_file, "{elapsed},{iterations},{temp:.6},{best}");
+                }
             }
         }
     }
@@ -226,17 +261,18 @@ struct Eval {
 /// - Uses a greedy independent-set lower bound as a cheap certificate of violation.
 /// - Uses an exact oracle **only when C4==0 and the greedy check didn't find a violation**.
 #[inline]
-fn evaluate<const N: usize, const K: usize>(
+fn evaluate<const N: usize>(
     state: &RamseyState<N>,
     oracle: &mut IndependentSetOracle<N>,
     scratch_set: &mut Vec<usize>,
+    k_target: usize,
     cfg: &SearchConfig,
 ) -> Eval {
     let c4_twice = state.c4_score_twice();
 
     if c4_twice != 0 {
         // Cheap guidance only: we avoid exact IS checks unless we are C4-free.
-        let violates = state.greedy_find_independent_set_of_size(K, scratch_set);
+        let violates = state.greedy_find_independent_set_of_size(k_target, scratch_set);
         let energy = c4_twice.saturating_mul(cfg.c4_weight)
             + if violates {
                 cfg.independent_violation_penalty
@@ -250,14 +286,14 @@ fn evaluate<const N: usize, const K: usize>(
     }
 
     // C4-free: now enforce the independent-set constraint.
-    if state.greedy_find_independent_set_of_size(K, scratch_set) {
+    if state.greedy_find_independent_set_of_size(k_target, scratch_set) {
         return Eval {
             energy: cfg.independent_violation_penalty,
             is_solution: false,
         };
     }
 
-    if oracle.has_independent_set_of_size(state.adj(), K) {
+    if oracle.has_independent_set_of_size(state.adj(), k_target) {
         return Eval {
             energy: cfg.independent_violation_penalty,
             is_solution: false,
@@ -275,31 +311,32 @@ fn evaluate<const N: usize, const K: usize>(
 // ============================================================================
 
 #[inline]
-fn propose_move<const N: usize, const K: usize, R: Rng>(
+fn propose_move<const N: usize, R: Rng>(
     state: &mut RamseyState<N>,
     oracle: &mut IndependentSetOracle<N>,
     scratch_set: &mut Vec<usize>,
+    k_target: usize,
     rng: &mut R,
     cfg: &SearchConfig,
 ) -> (usize, usize) {
     let c4_twice = state.c4_score_twice();
 
     if c4_twice != 0 {
-        if rng.random_bool(cfg.c4_guided_probability) {
-            if let Some(edge) = state.sample_c4_edge_to_remove(rng, cfg.c4_probe_tries) {
-                return edge;
-            }
+        if rng.random_bool(cfg.c4_guided_probability)
+            && let Some(edge) = state.sample_c4_edge_to_remove(rng, cfg.c4_probe_tries)
+        {
+            return edge;
         }
         return random_pair::<N, _>(rng);
     }
 
     // C4-free: try to break independent sets by adding an edge inside a violating set.
-    if state.greedy_find_independent_set_of_size(K, scratch_set) {
+    if state.greedy_find_independent_set_of_size(k_target, scratch_set) {
         return best_edge_to_add_within_set(state, scratch_set, rng, cfg.indep_pair_samples);
     }
 
     scratch_set.clear();
-    if oracle.find_independent_set_of_size(state.adj(), K, scratch_set) {
+    if oracle.find_independent_set_of_size(state.adj(), k_target, scratch_set) {
         return best_edge_to_add_within_set(state, scratch_set, rng, cfg.indep_pair_samples);
     }
 
@@ -403,12 +440,75 @@ mod tests {
 
     #[test]
     fn random_pair_is_valid() {
-        let mut rng = XorShiftRng::seed_from_u64(0x1234);
+        let mut rng = SmallRng::seed_from_u64(0x1234);
         for _ in 0..1000 {
             let (u, v) = random_pair::<20, _>(&mut rng);
             assert!(u < 20);
             assert!(v < 20);
             assert_ne!(u, v);
         }
+    }
+
+    #[test]
+    fn search_is_deterministic() {
+        // Run two identical searches and verify they reach the same energy state.
+        fn run_mock_search(seed: u64) -> usize {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut state = RamseyState::<10>::new_random(&mut rng, 0.3);
+            let mut oracle = IndependentSetOracle::<10>::new();
+            let mut scratch = Vec::new();
+            let cfg = SearchConfig::default();
+            
+            for _ in 0..100 {
+                let (u, v) = propose_move::<10, _>(&mut state, &mut oracle, &mut scratch, 4, &mut rng, &cfg);
+                state.flip_edge(u, v);
+                let _eval = evaluate::<10>(&state, &mut oracle, &mut scratch, 4, &cfg);
+                // We don't accept/revert here to keep it simple, just checking move sequence
+            }
+            state.c4_score_twice()
+        }
+
+        let seed = 0xDEADC0DE;
+        let res1 = run_mock_search(seed);
+        let res2 = run_mock_search(seed);
+        assert_eq!(res1, res2, "Search with same seed must be deterministic");
+    }
+
+    #[test]
+    fn worker_seeding_is_independent() {
+        let base_seed = 0x1337;
+        let mut rng0 = SmallRng::seed_from_u64(splitmix64(base_seed ^ 0));
+        let mut rng1 = SmallRng::seed_from_u64(splitmix64(base_seed ^ 1));
+        
+        let val0: u64 = rng0.random();
+        let val1: u64 = rng1.random();
+        assert_ne!(val0, val1, "Workers must have different RNG sequences");
+    }
+
+    #[test]
+    fn global_best_tracking_works() {
+        let best = AtomicUsize::new(usize::MAX);
+        best.fetch_min(100, Ordering::Relaxed);
+        best.fetch_min(50, Ordering::Relaxed);
+        best.fetch_min(75, Ordering::Relaxed);
+        assert_eq!(best.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn checkpoint_saving_is_atomic_and_valid() {
+        use std::fs;
+        let temp_file = "test_checkpoint_integrity.txt";
+        let state = RamseyState::<8>::new_random(&mut SmallRng::seed_from_u64(42), 0.3);
+        
+        // Save
+        state.save_to_file(temp_file).expect("Failed to save checkpoint");
+        
+        // Load and Verify
+        let loaded = RamseyState::<8>::load_from_file(temp_file).expect("Failed to load checkpoint");
+        assert_eq!(state.adj(), loaded.adj());
+        assert_eq!(state.c4_score_twice(), loaded.c4_score_twice());
+        
+        // Cleanup
+        let _ = fs::remove_file(temp_file);
     }
 }

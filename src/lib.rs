@@ -19,7 +19,7 @@
 //!     seed: Some(12345),
 //!     ..Default::default()
 //! };
-//! run_search::<13, 5>(&cfg);
+//! run_search::<13>(&cfg, 5);
 //! ```
 //!
 //! ## Validating Known Witnesses

@@ -121,7 +121,7 @@ impl Default for SearchConfig {
             c4_guided_probability: 0.9,
             c4_probe_tries: 128,
             indep_pair_samples: 32,
-            report_every: 1_000_000,
+            report_every: 100_000, // Balanced reporting frequency
             seed: None,
             resume_path: None,
             kick_threshold: 10_000_000,
@@ -262,6 +262,9 @@ fn solve_worker<const N: usize>(
     found_flag: &AtomicBool,
     global_best_energy: &AtomicUsize,
 ) {
+    if worker_id == 0 {
+        println!("[Worker 0] Starting search chain...");
+    }
     let mut rng = SmallRng::seed_from_u64(splitmix64(base_seed ^ (worker_id as u64)));
     let mut state = initialize_state::<N>(worker_id, &mut rng, cfg);
     let mut oracle = IndependentSetOracle::<N>::new();
@@ -286,11 +289,18 @@ fn solve_worker<const N: usize>(
     let mut local_best_energy = initial_energy;
     let mut elite_state = state.clone();
 
+    if worker_id == 0 {
+        println!("[Worker 0] Initial energy: {}", initial_energy);
+    }
+
     while !found_flag.load(Ordering::Relaxed) {
         iterations += 1;
         iters_since_best += 1;
 
         if iters_since_best >= cfg.kick_threshold {
+            if worker_id == 0 {
+                println!("\n[Worker 0] Applying kick (threshold reached)");
+            }
             apply_kick::<N>(&mut state, &mut rng, &mut cached_oracle, &mut tabu, cfg);
             current_energy =
                 evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg).energy;
@@ -298,7 +308,15 @@ fn solve_worker<const N: usize>(
             continue;
         }
 
-        let (u, v) = propose_move_with_tabu::<N, _>(&mut state, &mut oracle, &mut cached_oracle, &mut scratch_set, &mut rng, &tabu, cfg);
+        let (u, v) = propose_move_with_tabu::<N, _>(
+            &mut state,
+            &mut oracle,
+            &mut cached_oracle,
+            &mut scratch_set,
+            &mut rng,
+            &tabu,
+            cfg,
+        );
         state.flip_edge(u, v);
         cached_oracle.invalidate_edge(u, v);
         let eval = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg);
@@ -318,7 +336,13 @@ fn solve_worker<const N: usize>(
             }
         }
 
-        if accept_move(eval.energy, lahc_history[lahc_idx], current_energy, temp, &mut rng) {
+        if accept_move(
+            eval.energy,
+            lahc_history[lahc_idx],
+            current_energy,
+            temp,
+            &mut rng,
+        ) {
             current_energy = eval.energy;
             tabu.add(u, v);
         } else {
@@ -350,8 +374,13 @@ fn solve_worker<const N: usize>(
                 &mut current_energy,
                 cfg,
             ) {
-                // Restart happened; do not apply reheating in the same step.
+                if worker_id == 0 {
+                    println!("\n[Worker 0] Cold restart triggered!");
+                }
             } else if temp < cfg.reheat_threshold {
+                if worker_id == 0 {
+                    println!("\n[Worker 0] Reheating...");
+                }
                 temp = cfg.reheat_temp;
             }
             if worker_id == 0 && iterations.is_multiple_of(cfg.report_every) {

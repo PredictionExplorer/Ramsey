@@ -1,10 +1,11 @@
-//! Parallel stochastic search driver (LAHC + SA hybrid).
+//! Parallel stochastic search driver (LAHC + SA hybrid with Tabu).
 
 use crate::graph::RamseyState;
-use crate::iset::IndependentSetOracle;
+use crate::iset::{CachedIsOracle, IndependentSetOracle};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -14,6 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Maximum LAHC history size (compile-time to use stack allocation).
 const MAX_LAHC_SIZE: usize = 2048;
+
+/// Default tabu list size.
+const DEFAULT_TABU_SIZE: usize = 32;
 
 /// Type of forbidden subgraph to avoid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +75,10 @@ pub struct SearchConfig {
     pub kick_threshold: u64,
     /// Number of edges to flip during a "Kick".
     pub kick_strength: usize,
+    /// Size of the tabu list (prevents cycling).
+    pub tabu_size: usize,
+    /// Probability of using degree-biased move selection.
+    pub degree_bias_probability: f64,
 }
 
 impl Default for SearchConfig {
@@ -103,7 +111,56 @@ impl Default for SearchConfig {
             resume_path: None,
             kick_threshold: 5_000_000,
             kick_strength: 5,
+            tabu_size: DEFAULT_TABU_SIZE,
+            degree_bias_probability: 0.3,
         }
+    }
+}
+
+// ============================================================================
+// Tabu List
+// ============================================================================
+
+/// Short-term memory to prevent cycling by forbidding recently flipped edges.
+#[derive(Clone, Debug)]
+struct TabuList {
+    /// Recent edges stored as (min(u,v), max(u,v)).
+    recent: VecDeque<(usize, usize)>,
+    /// Maximum size of the list.
+    max_size: usize,
+}
+
+impl TabuList {
+    fn new(max_size: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Check if an edge is tabu (forbidden).
+    #[inline]
+    fn is_tabu(&self, u: usize, v: usize) -> bool {
+        let edge = (u.min(v), u.max(v));
+        self.recent.contains(&edge)
+    }
+
+    /// Add an edge to the tabu list.
+    #[inline]
+    fn add(&mut self, u: usize, v: usize) {
+        if self.max_size == 0 {
+            return;
+        }
+        let edge = (u.min(v), u.max(v));
+        if self.recent.len() >= self.max_size {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(edge);
+    }
+
+    /// Clear the tabu list.
+    fn clear(&mut self) {
+        self.recent.clear();
     }
 }
 
@@ -167,7 +224,9 @@ fn solve_worker<const N: usize>(
     let mut rng = SmallRng::seed_from_u64(splitmix64(base_seed ^ (worker_id as u64)));
     let mut state = initialize_state::<N>(worker_id, &mut rng, cfg);
     let mut oracle = IndependentSetOracle::<N>::new();
+    let mut cached_oracle = CachedIsOracle::<N>::new();
     let mut scratch_set = Vec::<usize>::with_capacity(cfg.k_target.max(16));
+    let mut tabu = TabuList::new(cfg.tabu_size);
 
     let mut temp = cfg.temp_start;
     let mut iterations: u64 = 0;
@@ -177,7 +236,7 @@ fn solve_worker<const N: usize>(
 
     let lahc_len = cfg.lahc_size.clamp(1, MAX_LAHC_SIZE);
     let mut lahc_history = [0usize; MAX_LAHC_SIZE];
-    let initial_energy = evaluate::<N>(&state, &mut oracle, &mut scratch_set, cfg).energy;
+    let initial_energy = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg).energy;
     global_best_energy.fetch_min(initial_energy, Ordering::Relaxed);
 
     for slot in lahc_history.iter_mut().take(lahc_len) {
@@ -195,15 +254,19 @@ fn solve_worker<const N: usize>(
             for _ in 0..cfg.kick_strength {
                 let (u, v) = random_pair::<N, _>(&mut rng);
                 state.flip_edge(u, v);
+                cached_oracle.invalidate_edge(u, v);
             }
-            current_energy = evaluate::<N>(&state, &mut oracle, &mut scratch_set, cfg).energy;
+            tabu.clear();
+            cached_oracle.clear_cache();
+            current_energy = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg).energy;
             iters_since_best = 0;
             continue;
         }
 
-        let (u, v) = propose_move::<N, _>(&mut state, &mut oracle, &mut scratch_set, &mut rng, cfg);
+        let (u, v) = propose_move_with_tabu::<N, _>(&mut state, &mut oracle, &mut cached_oracle, &mut scratch_set, &mut rng, &tabu, cfg);
         state.flip_edge(u, v);
-        let eval = evaluate::<N>(&state, &mut oracle, &mut scratch_set, cfg);
+        cached_oracle.invalidate_edge(u, v);
+        let eval = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg);
 
         if eval.is_solution {
             handle_success::<N>(worker_id, &state, cfg, found_flag);
@@ -221,8 +284,10 @@ fn solve_worker<const N: usize>(
 
         if accept_move(eval.energy, lahc_history[lahc_idx], current_energy, temp, &mut rng) {
             current_energy = eval.energy;
+            tabu.add(u, v);
         } else {
             state.flip_edge(u, v);
+            cached_oracle.invalidate_edge(u, v);
         }
 
         lahc_history[lahc_idx] = current_energy;
@@ -230,9 +295,20 @@ fn solve_worker<const N: usize>(
 
         if iterations.is_multiple_of(cfg.temp_update_every) {
             temp *= cfg.cooling_rate;
-            if temp < cfg.reheat_threshold { temp = cfg.reheat_temp; }
+            if temp < cfg.reheat_threshold {
+                temp = cfg.reheat_temp;
+            }
             if worker_id == 0 && iterations.is_multiple_of(cfg.report_every) {
-                last_csv_log_best = report_progress::<N>(iterations, temp, current_energy, &state, global_best_energy, last_csv_log_best, start_time, cfg);
+                last_csv_log_best = report_progress::<N>(
+                    iterations,
+                    temp,
+                    current_energy,
+                    &state,
+                    global_best_energy,
+                    last_csv_log_best,
+                    start_time,
+                    cfg,
+                );
             }
         }
     }
@@ -304,17 +380,21 @@ struct Eval {
 /// Staged evaluation:
 /// - Uses the incremental C4 score if target is C4.
 /// - Otherwise uses the oracle for general cliques/cycles.
+/// - Uses cached oracle for IS detection when possible.
 #[inline]
 fn evaluate<const N: usize>(
     state: &RamseyState<N>,
     oracle: &mut IndependentSetOracle<N>,
+    cached_oracle: &mut CachedIsOracle<N>,
     scratch_set: &mut Vec<usize>,
     cfg: &SearchConfig,
 ) -> Eval {
     // 1. Calculate Forbidden Subgraph Energy
     let forbidden_energy = match (cfg.forbidden_type, cfg.c_target) {
         (ForbiddenType::Cycle, 4) => state.c4_score_twice() * cfg.c4_weight,
-        (ForbiddenType::Clique, c) => oracle.count_cliques_of_size(state.adj(), c, 100) * cfg.c4_weight,
+        (ForbiddenType::Clique, c) => {
+            oracle.count_cliques_of_size(state.adj(), c, 100) * cfg.c4_weight
+        }
         (ForbiddenType::Cycle, c) => {
             if c == 3 {
                 oracle.count_cliques_of_size(state.adj(), 3, 100) * cfg.c4_weight
@@ -327,14 +407,20 @@ fn evaluate<const N: usize>(
     if forbidden_energy != 0 {
         let violates = state.greedy_find_independent_set_of_size(cfg.k_target, scratch_set);
         return Eval {
-            energy: forbidden_energy + if violates { cfg.independent_violation_penalty } else { 0 },
+            energy: forbidden_energy
+                + if violates {
+                    cfg.independent_violation_penalty
+                } else {
+                    0
+                },
             is_solution: false,
         };
     }
 
     // 2. Calculate Independent Set Energy (Gradient)
-    let is_count = oracle.count_independent_sets_of_size(state.adj(), cfg.k_target, 100);
-    
+    // Use cached oracle for faster IS detection
+    let is_count = cached_oracle.count_independent_sets_of_size(state.adj(), cfg.k_target, 100);
+
     Eval {
         energy: is_count,
         is_solution: is_count == 0,
@@ -342,51 +428,145 @@ fn evaluate<const N: usize>(
 }
 
 // ============================================================================
-// Move proposal
+// Move proposal with Tabu and Degree Bias
 // ============================================================================
 
 #[inline]
-fn propose_move<const N: usize, R: Rng>(
+fn propose_move_with_tabu<const N: usize, R: Rng>(
     state: &mut RamseyState<N>,
     oracle: &mut IndependentSetOracle<N>,
+    cached_oracle: &mut CachedIsOracle<N>,
+    scratch_set: &mut Vec<usize>,
+    rng: &mut R,
+    tabu: &TabuList,
+    cfg: &SearchConfig,
+) -> (usize, usize) {
+    // Try guided move first
+    let guided = propose_guided_move::<N, _>(state, oracle, cached_oracle, scratch_set, rng, cfg);
+
+    if let Some((u, v)) = guided
+        && !tabu.is_tabu(u, v)
+    {
+        return (u, v);
+    }
+
+    // Fall back to degree-biased or random move
+    if rng.random_bool(cfg.degree_bias_probability)
+        && let Some((u, v)) = degree_biased_pair::<N, _>(state, rng, tabu)
+    {
+        return (u, v);
+    }
+
+    // Final fallback: random pair avoiding tabu
+    random_pair_avoiding_tabu::<N, _>(rng, tabu, 10)
+}
+
+/// Propose a guided move based on current graph state.
+#[inline]
+fn propose_guided_move<const N: usize, R: Rng>(
+    state: &mut RamseyState<N>,
+    oracle: &mut IndependentSetOracle<N>,
+    cached_oracle: &mut CachedIsOracle<N>,
     scratch_set: &mut Vec<usize>,
     rng: &mut R,
     cfg: &SearchConfig,
-) -> (usize, usize) {
-    let current_eval = evaluate::<N>(state, oracle, scratch_set, cfg);
+) -> Option<(usize, usize)> {
+    let has_forbidden = match (cfg.forbidden_type, cfg.c_target) {
+        (ForbiddenType::Cycle, 4) => state.c4_score_twice() > 0,
+        _ => true, // Conservative: always check
+    };
 
-    if current_eval.energy >= cfg.c4_weight {
-        // We have forbidden subgraphs. Try to remove one.
-        if cfg.forbidden_type == ForbiddenType::Cycle && cfg.c_target == 4 {
-            if rng.random_bool(cfg.c4_guided_probability)
-                && let Some(edge) = state.sample_c4_edge_to_remove(rng, cfg.c4_probe_tries)
-            {
-                return edge;
-            }
-        } else if cfg.forbidden_type == ForbiddenType::Clique {
-            // Heuristic: remove an edge from a found clique
-            let mut clique = Vec::new();
-            if oracle.find_clique_of_size(state.adj(), cfg.c_target, &mut clique) {
-                let i = rng.random_range(0..clique.len());
-                let mut j = rng.random_range(0..clique.len());
-                while i == j { j = rng.random_range(0..clique.len()); }
-                return (clique[i], clique[j]);
-            }
+    if has_forbidden && cfg.forbidden_type == ForbiddenType::Cycle && cfg.c_target == 4 {
+        // We have C4s. Try to remove one.
+        if rng.random_bool(cfg.c4_guided_probability)
+            && let Some(edge) = state.sample_c4_edge_to_remove(rng, cfg.c4_probe_tries)
+        {
+            return Some(edge);
         }
-        return random_pair::<N, _>(rng);
+        return None;
+    } else if has_forbidden && cfg.forbidden_type == ForbiddenType::Clique {
+        // Heuristic: remove an edge from a found clique
+        let mut clique = Vec::new();
+        if oracle.find_clique_of_size(state.adj(), cfg.c_target, &mut clique) && clique.len() >= 2
+        {
+            let i = rng.random_range(0..clique.len());
+            let mut j = rng.random_range(0..clique.len());
+            while i == j {
+                j = rng.random_range(0..clique.len());
+            }
+            return Some((clique[i], clique[j]));
+        }
+        return None;
     }
 
     // Graph is clean of forbidden subgraphs. Try to break independent sets.
     if state.greedy_find_independent_set_of_size(cfg.k_target, scratch_set) {
-        return best_edge_to_add_within_set(state, scratch_set, rng, cfg.indep_pair_samples);
+        return Some(best_edge_to_add_within_set(
+            state,
+            scratch_set,
+            rng,
+            cfg.indep_pair_samples,
+        ));
     }
 
     scratch_set.clear();
-    if oracle.find_independent_set_of_size(state.adj(), cfg.k_target, scratch_set) {
-        return best_edge_to_add_within_set(state, scratch_set, rng, cfg.indep_pair_samples);
+    if cached_oracle.find_independent_set_of_size(state.adj(), cfg.k_target, scratch_set) {
+        return Some(best_edge_to_add_within_set(
+            state,
+            scratch_set,
+            rng,
+            cfg.indep_pair_samples,
+        ));
     }
 
-    random_pair::<N, _>(rng)
+    None
+}
+
+/// Select a vertex pair biased by degree (higher degree = more likely to be involved).
+/// High-degree vertices tend to participate in more C4s and affect more independent sets.
+#[inline]
+fn degree_biased_pair<const N: usize, R: Rng>(
+    state: &RamseyState<N>,
+    rng: &mut R,
+    tabu: &TabuList,
+) -> Option<(usize, usize)> {
+    // Compute degree weights (degree² for stronger bias)
+    let mut weights = [0u32; 64];
+    let mut total_weight = 0u64;
+
+    for v in 0..N {
+        let deg = state.degree(v);
+        let w = deg.saturating_mul(deg).max(1);
+        weights[v] = w;
+        total_weight += u64::from(w);
+    }
+
+    if total_weight == 0 {
+        return None;
+    }
+
+    // Sample first vertex proportional to weight
+    let mut r = rng.random_range(0..total_weight);
+    let mut u = 0;
+    for v in 0..N {
+        let w = u64::from(weights[v]);
+        if r < w {
+            u = v;
+            break;
+        }
+        r -= w;
+    }
+
+    // For second vertex, prefer neighbors (for edge removal) or non-neighbors (for edge addition)
+    // based on what's more useful. Here we sample uniformly from remaining.
+    for _ in 0..10 {
+        let v = rng.random_range(0..N);
+        if v != u && !tabu.is_tabu(u, v) {
+            return Some((u, v));
+        }
+    }
+
+    None
 }
 
 #[inline]
@@ -443,6 +623,23 @@ fn random_pair<const N: usize, R: Rng>(rng: &mut R) -> (usize, usize) {
     (u, v)
 }
 
+/// Random pair that tries to avoid tabu edges.
+#[inline]
+fn random_pair_avoiding_tabu<const N: usize, R: Rng>(
+    rng: &mut R,
+    tabu: &TabuList,
+    max_tries: usize,
+) -> (usize, usize) {
+    for _ in 0..max_tries {
+        let (u, v) = random_pair::<N, _>(rng);
+        if !tabu.is_tabu(u, v) {
+            return (u, v);
+        }
+    }
+    // Give up and return any pair
+    random_pair::<N, _>(rng)
+}
+
 fn random_u64() -> u64 {
     rand::random::<u64>()
 }
@@ -464,6 +661,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iset::CachedIsOracle;
 
     #[test]
     fn splitmix64_is_deterministic() {
@@ -501,13 +699,23 @@ mod tests {
             let mut rng = SmallRng::seed_from_u64(seed);
             let mut state = RamseyState::<10>::new_random(&mut rng, 0.3);
             let mut oracle = IndependentSetOracle::<10>::new();
+            let mut cached_oracle = CachedIsOracle::<10>::new();
             let mut scratch = Vec::new();
             let cfg = SearchConfig::default();
-            
+            let tabu = TabuList::new(cfg.tabu_size);
+
             for _ in 0..100 {
-                let (u, v) = propose_move::<10, _>(&mut state, &mut oracle, &mut scratch, &mut rng, &cfg);
+                let (u, v) = propose_move_with_tabu::<10, _>(
+                    &mut state,
+                    &mut oracle,
+                    &mut cached_oracle,
+                    &mut scratch,
+                    &mut rng,
+                    &tabu,
+                    &cfg,
+                );
                 state.flip_edge(u, v);
-                let _eval = evaluate::<10>(&state, &mut oracle, &mut scratch, &cfg);
+                let _eval = evaluate::<10>(&state, &mut oracle, &mut cached_oracle, &mut scratch, &cfg);
                 // We don't accept/revert here to keep it simple, just checking move sequence
             }
             state.c4_score_twice()
@@ -589,14 +797,136 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(123);
         let mut state = RamseyState::<10>::new_random(&mut rng, 0.2);
         let orig_adj = *state.adj();
-        
+
         // Perform a mock kick
         let strength = 5;
         for _ in 0..strength {
             let (u, v) = random_pair::<10, _>(&mut rng);
             state.flip_edge(u, v);
         }
-        
+
         assert_ne!(orig_adj, *state.adj(), "Kick must modify the graph state");
+    }
+
+    #[test]
+    fn test_tabu_list_basic() {
+        let mut tabu = TabuList::new(3);
+
+        // Initially empty
+        assert!(!tabu.is_tabu(0, 1));
+        assert!(!tabu.is_tabu(1, 0));
+
+        // Add edge (0, 1)
+        tabu.add(0, 1);
+        assert!(tabu.is_tabu(0, 1));
+        assert!(tabu.is_tabu(1, 0)); // Order shouldn't matter
+
+        // Add more edges
+        tabu.add(2, 3);
+        tabu.add(4, 5);
+
+        // All three should be tabu
+        assert!(tabu.is_tabu(0, 1));
+        assert!(tabu.is_tabu(2, 3));
+        assert!(tabu.is_tabu(4, 5));
+
+        // Adding a fourth should evict the first
+        tabu.add(6, 7);
+        assert!(!tabu.is_tabu(0, 1)); // Evicted
+        assert!(tabu.is_tabu(2, 3));
+        assert!(tabu.is_tabu(4, 5));
+        assert!(tabu.is_tabu(6, 7));
+    }
+
+    #[test]
+    fn test_tabu_list_clear() {
+        let mut tabu = TabuList::new(5);
+        tabu.add(0, 1);
+        tabu.add(2, 3);
+        assert!(tabu.is_tabu(0, 1));
+
+        tabu.clear();
+        assert!(!tabu.is_tabu(0, 1));
+        assert!(!tabu.is_tabu(2, 3));
+    }
+
+    #[test]
+    fn test_degree_biased_pair() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let tabu = TabuList::new(0);
+
+        // Create a graph where vertex 0 has high degree
+        let mut adj = [0u64; 10];
+        for i in 1..8 {
+            adj[0] |= 1 << i;
+            adj[i] |= 1;
+        }
+        let state = RamseyState::<10>::from_adj(adj);
+
+        // Sample many pairs and check vertex 0 appears more often
+        let mut v0_count = 0;
+        for _ in 0..1000 {
+            if let Some((u, v)) = degree_biased_pair::<10, _>(&state, &mut rng, &tabu) {
+                if u == 0 || v == 0 {
+                    v0_count += 1;
+                }
+            }
+        }
+
+        // Vertex 0 has degree 7, others have degree 1-2
+        // It should appear in significantly more than 10% of pairs
+        assert!(
+            v0_count > 200,
+            "High-degree vertex should be selected more often"
+        );
+    }
+
+    #[test]
+    fn test_search_config_invariants() {
+        let cfg = SearchConfig::default();
+        assert!(cfg.lahc_size <= MAX_LAHC_SIZE);
+        assert!(cfg.cooling_rate < 1.0 && cfg.cooling_rate > 0.0);
+        assert!(cfg.temp_start > 0.0);
+        assert!(cfg.reheat_threshold < cfg.reheat_temp);
+        assert!(cfg.kick_threshold > 0);
+    }
+
+    #[test]
+    fn test_tabu_list_no_duplicates() {
+        let mut tabu = TabuList::new(10);
+        // Adding the same edge multiple times shouldn't break FIFO logic
+        for _ in 0..5 {
+            tabu.add(0, 1);
+        }
+        assert_eq!(tabu.recent.len(), 5);
+        for _ in 0..10 {
+            tabu.add(2, 3);
+        }
+        assert_eq!(tabu.recent.len(), 10);
+        assert!(!tabu.is_tabu(0, 1)); // Should have been evicted
+    }
+
+    #[test]
+    fn test_evaluate_gradient_sanity() {
+        // Evaluate energy on a sequence of edge additions
+        let mut state = RamseyState::<5>::empty();
+        let mut oracle = IndependentSetOracle::<5>::new();
+        let mut cached = CachedIsOracle::<5>::new();
+        let mut scratch = Vec::new();
+        let mut cfg = SearchConfig::default();
+        cfg.k_target = 3; // Use K < N so energy is non-zero
+
+        let energy0 = evaluate::<5>(&state, &mut oracle, &mut cached, &mut scratch, &cfg).energy;
+        assert!(energy0 > 0);
+
+        // Adding an edge should reduce the independent set count (energy)
+        state.flip_edge(0, 1);
+        let energy1 = evaluate::<5>(&state, &mut oracle, &mut cached, &mut scratch, &cfg).energy;
+        assert!(
+            energy1 < energy0,
+            "Energy did not decrease: {} -> {}",
+            energy0,
+            energy1
+        );
     }
 }

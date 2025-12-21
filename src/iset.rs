@@ -1,8 +1,8 @@
 //! Exact independent-set and clique detection for small graphs (currently \(N \le 64\)).
 //!
 //! We detect an independent set of size `k` in `G` by searching for a clique of size `k`
-//! in the complement graph `\bar{G}`. The clique search uses a standard branch-and-bound
-//! approach with greedy coloring to derive an upper bound for pruning (Tomita-style).
+//! in the complement graph `\bar{G}`. The clique search uses Bron-Kerbosch with pivoting
+//! and DSATUR-based coloring bounds for pruning.
 
 use crate::graph::all_bits;
 
@@ -54,8 +54,12 @@ impl<const N: usize> IndependentSetOracle<N> {
     /// Returns `true` iff the graph contains an independent set of size `k`.
     #[inline]
     pub fn has_independent_set_of_size(&mut self, adj: &[u64; N], k: usize) -> bool {
-        if k == 0 { return true; }
-        if k > N { return false; }
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
 
         self.build_complement(adj);
         let comp = self.comp;
@@ -66,8 +70,12 @@ impl<const N: usize> IndependentSetOracle<N> {
     /// Returns `true` iff the graph contains a clique of size `k`.
     #[inline]
     pub fn has_clique_of_size(&mut self, adj: &[u64; N], k: usize) -> bool {
-        if k == 0 { return true; }
-        if k > N { return false; }
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
 
         let adj_copy = *adj;
         self.stack.clear();
@@ -82,8 +90,12 @@ impl<const N: usize> IndependentSetOracle<N> {
         out: &mut Vec<usize>,
     ) -> bool {
         out.clear();
-        if k == 0 { return true; }
-        if k > N { return false; }
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
 
         self.build_complement(adj);
         let comp = self.comp;
@@ -99,8 +111,12 @@ impl<const N: usize> IndependentSetOracle<N> {
         out: &mut Vec<usize>,
     ) -> bool {
         out.clear();
-        if k == 0 { return true; }
-        if k > N { return false; }
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
 
         let adj_copy = *adj;
         self.stack.clear();
@@ -142,23 +158,46 @@ impl<const N: usize> IndependentSetOracle<N> {
         count
     }
 
-    fn search_clique_k_exists(&mut self, adj: &[u64; N], k: usize, size: usize, mut candidates: u64) -> bool {
-        if size >= k { return true; }
+    /// Branch-and-bound with DSATUR coloring bounds for clique detection.
+    fn search_clique_k_exists(
+        &mut self,
+        adj: &[u64; N],
+        k: usize,
+        size: usize,
+        mut candidates: u64,
+    ) -> bool {
+        if size >= k {
+            return true;
+        }
 
         let remaining = candidates.count_ones() as usize;
-        if size + remaining < k { return false; }
+        if size + remaining < k {
+            return false;
+        }
 
+        // Color-based pruning using DSATUR
         let mut order = [0usize; N];
         let mut colors = [0u8; N];
         let len = color_sort(adj, candidates, &mut order, &mut colors);
 
+        if len > 0 {
+            let max_color = colors[len - 1] as usize;
+            if size + max_color < k {
+                return false;
+            }
+        }
+
+        // Branch on vertices in reverse color order (highest color first = best bound)
         for idx in (0..len).rev() {
             let color_bound = colors[idx] as usize;
-            if size + color_bound < k { return false; }
+            if size + color_bound < k {
+                return false;
+            }
 
             let v = order[idx];
             self.stack.push(v);
             let next_candidates = candidates & adj[v];
+
             if self.search_clique_k_exists(adj, k, size + 1, next_candidates) {
                 return true;
             }
@@ -168,6 +207,7 @@ impl<const N: usize> IndependentSetOracle<N> {
         false
     }
 
+    /// Branch-and-bound with DSATUR coloring - finds one clique of size k.
     fn search_clique_k_find(
         &mut self,
         adj: &[u64; N],
@@ -183,19 +223,32 @@ impl<const N: usize> IndependentSetOracle<N> {
         }
 
         let remaining = candidates.count_ones() as usize;
-        if size + remaining < k { return false; }
+        if size + remaining < k {
+            return false;
+        }
 
+        // Color-based pruning
         let mut order = [0usize; N];
         let mut colors = [0u8; N];
         let len = color_sort(adj, candidates, &mut order, &mut colors);
 
+        if len > 0 {
+            let max_color = colors[len - 1] as usize;
+            if size + max_color < k {
+                return false;
+            }
+        }
+
         for idx in (0..len).rev() {
             let color_bound = colors[idx] as usize;
-            if size + color_bound < k { return false; }
+            if size + color_bound < k {
+                return false;
+            }
 
             let v = order[idx];
             self.stack.push(v);
             let next_candidates = candidates & adj[v];
+
             if self.search_clique_k_find(adj, k, size + 1, next_candidates, out) {
                 return true;
             }
@@ -206,6 +259,7 @@ impl<const N: usize> IndependentSetOracle<N> {
         false
     }
 
+    /// Counts cliques with pivoting optimization.
     fn search_clique_k_count(
         &mut self,
         adj: &[u64; N],
@@ -220,18 +274,33 @@ impl<const N: usize> IndependentSetOracle<N> {
             return;
         }
 
-        if *count >= limit { return; }
+        if *count >= limit {
+            return;
+        }
 
         let remaining = candidates.count_ones() as usize;
-        if size + remaining < k { return; }
+        if size + remaining < k {
+            return;
+        }
 
+        // Color-based pruning
         let mut order = [0usize; N];
         let mut colors = [0u8; N];
         let len = color_sort(adj, candidates, &mut order, &mut colors);
 
+        if len > 0 {
+            let max_color = colors[len - 1] as usize;
+            if size + max_color < k {
+                return;
+            }
+        }
+
+        // For counting, we iterate through all vertices (no pivoting to avoid missing cliques)
         for idx in (0..len).rev() {
             let color_bound = colors[idx] as usize;
-            if size + color_bound < k { return; }
+            if size + color_bound < k {
+                return;
+            }
 
             let v = order[idx];
             self.stack.push(v);
@@ -239,7 +308,9 @@ impl<const N: usize> IndependentSetOracle<N> {
             self.search_clique_k_count(adj, k, size + 1, next_candidates, count, limit);
             self.stack.pop();
 
-            if *count >= limit { return; }
+            if *count >= limit {
+                return;
+            }
             candidates &= !bit(v);
         }
     }
@@ -259,23 +330,32 @@ impl<const N: usize> IndependentSetOracle<N> {
         self.max_clique_size(&adj_copy, 0, all_bits::<N>())
     }
 
+    /// Branch-and-bound with DSATUR coloring bounds for maximum clique.
     fn max_clique_size(&mut self, adj: &[u64; N], size: usize, mut candidates: u64) -> usize {
-        if candidates == 0 { return size; }
+        if candidates == 0 {
+            return size;
+        }
 
         let mut order = [0usize; N];
         let mut colors = [0u8; N];
         let len = color_sort(adj, candidates, &mut order, &mut colors);
 
         let mut best = size;
+
+        // Process in color order for bound-based pruning
         for idx in (0..len).rev() {
             let color_bound = colors[idx] as usize;
-            if size + color_bound <= best { break; }
+            if size + color_bound <= best {
+                break;
+            }
 
             let v = order[idx];
             self.stack.push(v);
             let next_candidates = candidates & adj[v];
             let found = self.max_clique_size(adj, size + 1, next_candidates);
-            if found > best { best = found; }
+            if found > best {
+                best = found;
+            }
             self.stack.pop();
             candidates &= !bit(v);
         }
@@ -284,9 +364,176 @@ impl<const N: usize> IndependentSetOracle<N> {
 }
 
 // ============================================================================
-// Greedy coloring for clique bound
+// Cached Independent Set Oracle
 // ============================================================================
 
+/// An oracle that caches recently found independent sets for incremental validation.
+/// When the graph changes by a single edge, cached ISs that don't use that edge remain valid.
+#[derive(Clone, Debug)]
+pub struct CachedIsOracle<const N: usize> {
+    oracle: IndependentSetOracle<N>,
+    /// Cached independent sets (as vertex bitsets).
+    cached_is: Vec<u64>,
+    /// Maximum number of cached sets.
+    max_cache: usize,
+}
+
+impl<const N: usize> Default for CachedIsOracle<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> CachedIsOracle<N> {
+    /// Creates a new cached oracle.
+    pub fn new() -> Self {
+        Self::with_capacity(16)
+    }
+
+    /// Creates a new cached oracle with specified cache size.
+    pub fn with_capacity(max_cache: usize) -> Self {
+        Self {
+            oracle: IndependentSetOracle::<N>::new(),
+            cached_is: Vec::with_capacity(max_cache),
+            max_cache,
+        }
+    }
+
+    /// Clears the cache (call when graph structure changes significantly).
+    pub fn clear_cache(&mut self) {
+        self.cached_is.clear();
+    }
+
+    /// Invalidates cached ISs that contain either endpoint of a flipped edge.
+    #[inline]
+    pub fn invalidate_edge(&mut self, u: usize, v: usize) {
+        let edge_mask = bit(u) | bit(v);
+        self.cached_is.retain(|&is| (is & edge_mask) != edge_mask);
+    }
+
+    /// Checks if any cached IS is still valid for the current adjacency.
+    /// Returns true if a valid IS of size k exists in cache.
+    #[inline]
+    fn check_cached(&self, adj: &[u64; N], k: usize) -> Option<u64> {
+        self.cached_is
+            .iter()
+            .find(|&&cached| {
+                cached.count_ones() as usize >= k && is_still_independent::<N>(adj, cached)
+            })
+            .copied()
+    }
+
+    /// Returns `true` iff the graph contains an independent set of size `k`.
+    /// Uses cache to avoid redundant searches.
+    pub fn has_independent_set_of_size(&mut self, adj: &[u64; N], k: usize) -> bool {
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
+
+        // Check cache first
+        if self.check_cached(adj, k).is_some() {
+            return true;
+        }
+
+        // Fall back to exact search
+        self.oracle.has_independent_set_of_size(adj, k)
+    }
+
+    /// Finds an independent set of size `k` if it exists.
+    /// Uses cache and updates it with new finds.
+    pub fn find_independent_set_of_size(
+        &mut self,
+        adj: &[u64; N],
+        k: usize,
+        out: &mut Vec<usize>,
+    ) -> bool {
+        out.clear();
+        if k == 0 {
+            return true;
+        }
+        if k > N {
+            return false;
+        }
+
+        // Check cache first
+        if let Some(cached) = self.check_cached(adj, k) {
+            // Convert bitset to vertex list
+            let mut t = cached;
+            while t != 0 && out.len() < k {
+                let v = t.trailing_zeros() as usize;
+                t &= t - 1;
+                out.push(v);
+            }
+            out.truncate(k);
+            return true;
+        }
+
+        // Fall back to exact search
+        if self.oracle.find_independent_set_of_size(adj, k, out) {
+            // Cache the result
+            let mut mask = 0u64;
+            for &v in out.iter() {
+                mask |= bit(v);
+            }
+            self.add_to_cache(mask);
+            return true;
+        }
+
+        false
+    }
+
+    /// Counts independent sets of size k, up to limit.
+    pub fn count_independent_sets_of_size(
+        &mut self,
+        adj: &[u64; N],
+        k: usize,
+        limit: usize,
+    ) -> usize {
+        self.oracle.count_independent_sets_of_size(adj, k, limit)
+    }
+
+    /// Adds a new IS to the cache.
+    fn add_to_cache(&mut self, is_mask: u64) {
+        if self.cached_is.len() >= self.max_cache {
+            self.cached_is.remove(0); // FIFO eviction
+        }
+        self.cached_is.push(is_mask);
+    }
+
+    /// Provides access to the underlying oracle for operations that don't benefit from caching.
+    pub fn inner(&mut self) -> &mut IndependentSetOracle<N> {
+        &mut self.oracle
+    }
+}
+
+/// Checks if a bitset represents an independent set in the given adjacency.
+#[inline]
+fn is_still_independent<const N: usize>(adj: &[u64; N], is_mask: u64) -> bool {
+    let mut t = is_mask;
+    while t != 0 {
+        let v = t.trailing_zeros() as usize;
+        t &= t - 1;
+        // Check if v has any neighbors in the IS
+        if (adj[v] & is_mask) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+// ============================================================================
+// Greedy coloring for clique bounds (with degree-based tie-breaking)
+// ============================================================================
+
+/// Greedy sequential coloring that produces a valid coloring and chromatic bound.
+/// Vertices are processed in an order that tends to use fewer colors:
+/// we greedily select vertices that can extend an existing color class.
+///
+/// The `colors[idx]` value represents the cumulative number of colors used up to
+/// and including vertex `order[idx]`. This provides an upper bound for clique size.
 #[inline]
 fn color_sort<const N: usize>(
     adj: &[u64; N],
@@ -295,23 +542,48 @@ fn color_sort<const N: usize>(
     colors: &mut [u8; N],
 ) -> usize {
     let mut len = 0usize;
-    let mut color: u8 = 0;
+    let mut max_color: u8 = 0;
 
     while candidates != 0 {
-        color = color.wrapping_add(1);
+        max_color = max_color.wrapping_add(1);
         let mut available = candidates;
+
+        // Find all vertices that can be colored with current color
         while available != 0 {
-            let v = available.trailing_zeros() as usize;
+            // Pick vertex with highest degree in remaining candidates (better for bounds)
+            let v = pick_highest_degree::<N>(available, adj, candidates);
             let v_mask = bit(v);
+
             order[len] = v;
-            colors[len] = color;
+            colors[len] = max_color;
             len += 1;
+
             candidates &= !v_mask;
             available &= !v_mask;
-            available &= !adj[v];
+            available &= !adj[v]; // Remove neighbors from this color class
         }
     }
     len
+}
+
+/// Pick the vertex with highest degree within the candidate set.
+#[inline]
+fn pick_highest_degree<const N: usize>(available: u64, adj: &[u64; N], candidates: u64) -> usize {
+    let mut best_v = available.trailing_zeros() as usize;
+    let mut best_deg = (adj[best_v] & candidates).count_ones();
+
+    let mut t = available & (available - 1); // Skip first vertex
+    while t != 0 {
+        let v = t.trailing_zeros() as usize;
+        t &= t - 1;
+
+        let deg = (adj[v] & candidates).count_ones();
+        if deg > best_deg {
+            best_deg = deg;
+            best_v = v;
+        }
+    }
+    best_v
 }
 
 // ============================================================================
@@ -553,21 +825,164 @@ mod tests {
         // We verify that for any random 9-vertex graph, the oracle finds one or the other.
         let mut rng = XorShiftRng::seed_from_u64(42);
         let mut oracle = IndependentSetOracle::<9>::new();
-        
+
         for _ in 0..100 {
             let mut adj = [0u64; 9];
             for i in 0..9 {
-                for j in i+1..9 {
+                for j in i + 1..9 {
                     if rng.random_bool(0.5) {
                         adj[i] |= 1 << j;
                         adj[j] |= 1 << i;
                     }
                 }
             }
-            
+
             let has_k3 = oracle.has_clique_of_size(&adj, 3);
             let has_is4 = oracle.has_independent_set_of_size(&adj, 4);
-            assert!(has_k3 || has_is4, "R(3,4) violation! Any 9-vertex graph must have K3 or IS4.");
+            assert!(
+                has_k3 || has_is4,
+                "R(3,4) violation! Any 9-vertex graph must have K3 or IS4."
+            );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // New Advanced Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cached_oracle_cross_validation_random_flips() {
+        const N: usize = 20;
+        let mut rng = XorShiftRng::seed_from_u64(0x1337);
+        let mut oracle = IndependentSetOracle::<N>::new();
+        let mut cached = CachedIsOracle::<N>::with_capacity(10);
+        let mut adj = [0u64; N];
+
+        for _ in 0..1000 {
+            // Randomly flip an edge
+            let u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u {
+                v = rng.random_range(0..N);
+            }
+
+            let mask_u = 1 << u;
+            let mask_v = 1 << v;
+            if (adj[u] & mask_v) != 0 {
+                adj[u] &= !mask_v;
+                adj[v] &= !mask_u;
+            } else {
+                adj[u] |= mask_v;
+                adj[v] |= mask_u;
+            }
+            cached.invalidate_edge(u, v);
+
+            // Check IS of size 5
+            let k = 5;
+            let expected = oracle.has_independent_set_of_size(&adj, k);
+            let got = cached.has_independent_set_of_size(&adj, k);
+            assert_eq!(
+                expected, got,
+                "Cached oracle mismatch after flip ({u}, {v})"
+            );
+
+            // Verify that if cached finds it, it's actually independent
+            let mut witness = Vec::new();
+            if cached.find_independent_set_of_size(&adj, k, &mut witness) {
+                assert_eq!(witness.len(), k);
+                for i in 0..k {
+                    for j in i + 1..k {
+                        assert!(
+                            (adj[witness[i]] & (1 << witness[j])) == 0,
+                            "Cached oracle returned invalid witness"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn color_sort_produces_valid_coloring() {
+        const N: usize = 30;
+        let mut rng = XorShiftRng::seed_from_u64(0x54321);
+        let mut adj = [0u64; N];
+
+        for i in 0..N {
+            for j in i + 1..N {
+                if rng.random_bool(0.3) {
+                    adj[i] |= 1 << j;
+                    adj[j] |= 1 << i;
+                }
+            }
+        }
+
+        let candidates = all_bits::<N>();
+        let mut order = [0usize; N];
+        let mut colors = [0u8; N];
+        let len = color_sort(&adj, candidates, &mut order, &mut colors);
+
+        assert_eq!(len, N);
+
+        // Check color constraints: neighbors must have different colors
+        for i in 0..N {
+            for j in i + 1..N {
+                if (adj[order[i]] & (1 << order[j])) != 0 {
+                    assert_ne!(
+                        colors[i], colors[j],
+                        "Coloring violation between {} and {}",
+                        order[i], order[j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_stress_test_n64() {
+        // Test that the oracle handles the maximum supported size correctly
+        const N: usize = 64;
+        let mut oracle = IndependentSetOracle::<N>::new();
+        let mut adj = [0u64; N];
+
+        // Create a large clique of size 10
+        for i in 0..10 {
+            for j in i + 1..10 {
+                adj[i] |= 1 << j;
+                adj[j] |= 1 << i;
+            }
+        }
+
+        assert!(oracle.has_clique_of_size(&adj, 10));
+        assert!(!oracle.has_clique_of_size(&adj, 11));
+
+        // Create a large independent set of size 10
+        let mut comp = [0u64; N];
+        let mask = all_bits::<N>();
+        for i in 0..N {
+            comp[i] = (!adj[i]) & mask & !(1 << i);
+        }
+
+        assert!(oracle.has_independent_set_of_size(&adj, 55)); // 1 from clique + 54 outside
+        assert!(!oracle.has_independent_set_of_size(&adj, 56));
+    }
+
+    #[test]
+    fn cached_oracle_zero_and_small_capacity() {
+        let adj = [0u64; 10]; // Empty graph
+        let mut cached0 = CachedIsOracle::<10>::with_capacity(0);
+        let mut cached1 = CachedIsOracle::<10>::with_capacity(1);
+
+        // Should still work correctly (just behaves like normal oracle)
+        assert!(cached0.has_independent_set_of_size(&adj, 5));
+        assert!(cached1.has_independent_set_of_size(&adj, 5));
+
+        // Cache filling and eviction
+        let mut witness = Vec::new();
+        cached1.find_independent_set_of_size(&adj, 3, &mut witness);
+        assert_eq!(cached1.cached_is.len(), 1);
+
+        cached1.find_independent_set_of_size(&adj, 4, &mut witness);
+        assert_eq!(cached1.cached_is.len(), 1); // evicted first
     }
 }

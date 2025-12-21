@@ -719,9 +719,7 @@ mod tests {
         let state = RamseyState::<5>::complete();
         // K5 has 5*4/2 = 10 edges
         assert_eq!(state.edge_count(), 10);
-        // K5 has C(5,4) = 5 copies of C4 (each 4-subset forms a K4 which has 3 C4s)
-        // Actually, for Kn: number of C4 = C(n,4) * 3 = n*(n-1)*(n-2)*(n-3)/8
-        // For n=5: 5*4*3*2/8 = 120/8 = 15
+        // K5 has C(5,4) * 3 = 15 copies of C4
         assert_eq!(state.c4_count(), 15);
     }
 
@@ -837,10 +835,6 @@ mod tests {
             // Has C4, sampling should return an edge that's in a C4
             if let Some((u, v)) = state.sample_c4_edge_to_remove(&mut rng, 100) {
                 assert!(state.has_edge(u, v), "returned non-edge");
-                // The edge should have >= 2 common neighbors (part of a C4)
-                // Actually, edges in C4 have common_neighbors[u][v] >= 2 OR
-                // they're on the "sides" of C4s involving their endpoints
-                // Let's just verify it's a valid edge
                 assert!(u != v);
                 assert!(u < N && v < N);
             }
@@ -855,6 +849,27 @@ mod tests {
         ];
         let state = RamseyState::<5>::from_adj(adj);
         assert!(state.find_c4_edges(100).is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Invariant validation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic]
+    fn from_adj_panics_on_self_loop() {
+        let mut adj = [0u64; 4];
+        adj[0] = 0b0001; // Edge 0-0
+        let _ = RamseyState::<4>::from_adj(adj);
+    }
+
+    #[test]
+    #[should_panic]
+    fn from_adj_panics_on_asymmetry() {
+        let mut adj = [0u64; 4];
+        adj[0] = 0b0010; // 0-1
+        // adj[1] should be 0b0001 but is 0
+        let _ = RamseyState::<4>::from_adj(adj);
     }
 
     // -------------------------------------------------------------------------

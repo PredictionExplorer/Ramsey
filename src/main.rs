@@ -1,10 +1,9 @@
 use std::num::NonZero;
+use ramsey::search::{SearchConfig, ForbiddenType};
 
 fn main() {
-    let mut cfg = ramsey::search::SearchConfig::default();
+    let mut cfg = SearchConfig::default();
     let mut validate_only = false;
-    let mut target_n = 39;
-    let mut target_k = 11;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -14,18 +13,25 @@ fn main() {
                 validate_only = true;
                 i += 1;
             }
-            "--case" => {
-                target_n = args
-                    .get(i + 1)
-                    .unwrap_or_else(|| usage_and_exit(2))
-                    .parse()
-                    .unwrap_or_else(|_| usage_and_exit(2));
-                target_k = args
-                    .get(i + 2)
-                    .unwrap_or_else(|| usage_and_exit(2))
-                    .parse()
-                    .unwrap_or_else(|_| usage_and_exit(2));
-                i += 3;
+            "-n" => {
+                cfg.n_target = args.get(i + 1).unwrap_or_else(|| usage_and_exit(2)).parse().unwrap_or_else(|_| usage_and_exit(2));
+                i += 2;
+            }
+            "-k" => {
+                cfg.k_target = args.get(i + 1).unwrap_or_else(|| usage_and_exit(2)).parse().unwrap_or_else(|_| usage_and_exit(2));
+                i += 2;
+            }
+            "-c" => {
+                cfg.c_target = args.get(i + 1).unwrap_or_else(|| usage_and_exit(2)).parse().unwrap_or_else(|_| usage_and_exit(2));
+                i += 2;
+            }
+            "--clique" => {
+                cfg.forbidden_type = ForbiddenType::Clique;
+                i += 1;
+            }
+            "--cycle" => {
+                cfg.forbidden_type = ForbiddenType::Cycle;
+                i += 1;
             }
             "--chains" | "--workers" => {
                 let v = args.get(i + 1).unwrap_or_else(|| usage_and_exit(2));
@@ -40,6 +46,10 @@ fn main() {
             "--seed" => {
                 let v = args.get(i + 1).unwrap_or_else(|| usage_and_exit(2));
                 cfg.seed = Some(v.parse().unwrap_or_else(|_| usage_and_exit(2)));
+                i += 2;
+            }
+            "--resume" => {
+                cfg.resume_path = Some(args.get(i + 1).unwrap_or_else(|| usage_and_exit(2)).clone());
                 i += 2;
             }
             "--help" | "-h" => usage_and_exit(0),
@@ -61,13 +71,12 @@ fn main() {
     }
 
     // Macro-based dispatcher for const generic N.
-    // This allows absolute maximum performance for any N <= 64.
     macro_rules! dispatch {
         ($($n:literal),*) => {
-            match target_n {
-                $($n => ramsey::search::run_search::<$n>(&cfg, target_k),)*
+            match cfg.n_target {
+                $($n => ramsey::search::run_search::<$n>(&cfg),)*
                 _ => {
-                    eprintln!("Error: N={target_n} is not supported (max 64).");
+                    eprintln!("Error: N={} is not supported (max 64).", cfg.n_target);
                     std::process::exit(2);
                 }
             }
@@ -91,7 +100,11 @@ fn usage_and_exit(code: i32) -> ! {
         "Ultra-Optimized Ramsey Search Engine\n\
          Usage: ramsey [OPTIONS]\n\n\
          Options:\n  \
-         --case N K              Target graph order and independent set size (default: 39 11)\n  \
+         -n N                    Target graph order (default: 39)\n  \
+         -k K                    Target independent set size to avoid (default: 11)\n  \
+         -c C                    Target cycle/clique size to avoid (default: 4)\n  \
+         --clique                Search for R(K_c, K_k) instead of R(C_c, K_k)\n  \
+         --cycle                 Search for R(C_c, K_k) (default)\n  \
          --workers/--chains N     Number of parallel search chains (default: {default_chains})\n  \
          --p P                    Initial edge probability (default: 0.18)\n  \
          --seed SEED              Deterministic base seed for reproducibility\n  \

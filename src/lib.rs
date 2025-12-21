@@ -16,10 +16,12 @@
 //! // Run a search for R(C4, K5) > 12
 //! let cfg = SearchConfig {
 //!     chains: 8,
+//!     n_target: 13,
+//!     k_target: 5,
 //!     seed: Some(12345),
 //!     ..Default::default()
 //! };
-//! run_search::<13>(&cfg, 5);
+//! run_search::<13>(&cfg);
 //! ```
 //!
 //! ## Validating Known Witnesses

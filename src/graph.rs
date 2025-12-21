@@ -350,14 +350,31 @@ impl<const N: usize> RamseyState<N> {
 
     /// Finds all edges that are part of at least one C4. Returns up to `limit` edges.
     pub fn find_c4_edges(&self, limit: usize) -> Vec<(usize, usize)> {
-        let mut result = Vec::with_capacity(limit.min(N * N / 4));
+        let mut result = Vec::with_capacity(limit);
+        let mut seen = std::collections::HashSet::new();
 
         for i in 0..N {
             for j in (i + 1)..N {
-                if self.common_neighbors[i][j] >= 2 && self.has_edge(i, j) {
-                    result.push((i, j));
-                    if result.len() >= limit {
-                        return result;
+                let cn = self.common_neighbors[i][j] as usize;
+                if cn >= 2 {
+                    // Vertices i and j have cn >= 2 common neighbors.
+                    // Every edge from i to these common neighbors is in a C4.
+                    // Every edge from j to these common neighbors is in a C4.
+                    let mut common = self.adj[i] & self.adj[j];
+                    while common != 0 {
+                        let w = common.trailing_zeros() as usize;
+                        common &= common - 1;
+
+                        // Edges (i, w) and (j, w) are in C4s formed by i, j and other common neighbors.
+                        for v in [i, j] {
+                            let (u1, u2) = if v < w { (v, w) } else { (w, v) };
+                            if seen.insert((u1, u2)) {
+                                result.push((u1, u2));
+                                if result.len() >= limit {
+                                    return result;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -965,5 +982,77 @@ mod tests {
         assert_eq!(state.degree(1), 1);
         assert_eq!(state.degree(2), 1);
         assert_eq!(state.degree(3), 1);
+    }
+
+    #[test]
+    fn handshaking_lemma_holds() {
+        const N: usize = 32;
+        let mut rng = XorShiftRng::seed_from_u64(42);
+        for _ in 0..10 {
+            let state = RamseyState::<N>::new_random(&mut rng, 0.25);
+            let mut sum_deg = 0;
+            for i in 0..N {
+                sum_deg += state.degree(i);
+            }
+            assert_eq!(sum_deg as usize, 2 * state.edge_count());
+        }
+    }
+
+    #[test]
+    fn common_neighbors_consistency() {
+        const N: usize = 20;
+        let mut rng = XorShiftRng::seed_from_u64(123);
+        let mut state = RamseyState::<N>::new_random(&mut rng, 0.4);
+
+        for _ in 0..1000 {
+            let u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u {
+                v = rng.random_range(0..N);
+            }
+            state.flip_edge(u, v);
+
+            // Cross-check all common neighbor counts
+            for i in 0..N {
+                for j in (i + 1)..N {
+                    let expected = (state.adj[i] & state.adj[j]).count_ones() as u8;
+                    assert_eq!(
+                        state.common_neighbor_count(i, j),
+                        expected,
+                        "Mismatch for ({i}, {j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_c4_edges_is_accurate() {
+        const N: usize = 10;
+        // Create a known C4: 0-1-2-3-0
+        let mut adj = [0u64; N];
+        let edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
+        for (u, v) in edges {
+            adj[u] |= 1 << v;
+            adj[v] |= 1 << u;
+        }
+        let state = RamseyState::<N>::from_adj(adj);
+        let c4_edges = state.find_c4_edges(100);
+
+        // Every edge in that cycle should be part of at least one C4
+        for (u, v) in edges {
+            assert!(
+                c4_edges.contains(&(u.min(v), u.max(v))),
+                "Edge ({u}, {v}) missing from C4 list"
+            );
+        }
+    }
+
+    #[test]
+    fn all_bits_mask_correctness() {
+        assert_eq!(all_bits::<0>(), 0);
+        assert_eq!(all_bits::<1>(), 1);
+        assert_eq!(all_bits::<32>(), 0xFFFF_FFFF);
+        assert_eq!(all_bits::<64>(), u64::MAX);
     }
 }

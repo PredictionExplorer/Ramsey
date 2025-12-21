@@ -825,7 +825,7 @@ mod tests {
         // We verify that for any random 9-vertex graph, the oracle finds one or the other.
         let mut rng = XorShiftRng::seed_from_u64(42);
         let mut oracle = IndependentSetOracle::<9>::new();
-
+        
         for _ in 0..100 {
             let mut adj = [0u64; 9];
             for i in 0..9 {
@@ -836,7 +836,7 @@ mod tests {
                     }
                 }
             }
-
+            
             let has_k3 = oracle.has_clique_of_size(&adj, 3);
             let has_is4 = oracle.has_independent_set_of_size(&adj, 4);
             assert!(
@@ -984,5 +984,84 @@ mod tests {
 
         cached1.find_independent_set_of_size(&adj, 4, &mut witness);
         assert_eq!(cached1.cached_is.len(), 1); // evicted first
+    }
+
+    #[test]
+    fn oracle_monotonicity_property() {
+        const N: usize = 16;
+        let mut rng = XorShiftRng::seed_from_u64(999);
+        let mut oracle = IndependentSetOracle::<N>::new();
+        let mut adj = [0u64; N];
+
+        for _ in 0..500 {
+            let u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u {
+                v = rng.random_range(0..N);
+            }
+
+            let was_independent = oracle.has_independent_set_of_size(&adj, 4);
+
+            // Add an edge
+            let mask_u = 1 << u;
+            let mask_v = 1 << v;
+            let existed = (adj[u] & mask_v) != 0;
+            adj[u] |= mask_v;
+            adj[v] |= mask_u;
+
+            let is_independent_after = oracle.has_independent_set_of_size(&adj, 4);
+
+            if !existed {
+                // Adding an edge can only DESTROY independent sets
+                // was_independent=false => is_independent_after=false
+                if !was_independent {
+                    assert!(
+                        !is_independent_after,
+                        "Adding an edge created an independent set?"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_set_duality_omega_alpha() {
+        // ω(G) = α(G_complement)
+        const N: usize = 12;
+        let mut rng = XorShiftRng::seed_from_u64(777);
+        let mut oracle = IndependentSetOracle::<N>::new();
+
+        for _ in 0..20 {
+            let mut adj = [0u64; N];
+            let mut comp = [0u64; N];
+            let mask = all_bits::<N>();
+
+            for i in 0..N {
+                for j in i + 1..N {
+                    if rng.random_bool(0.5) {
+                        adj[i] |= 1 << j;
+                        adj[j] |= 1 << i;
+                    }
+                }
+            }
+            for i in 0..N {
+                comp[i] = (!adj[i]) & mask & !(1 << i);
+            }
+
+            let omega = oracle.clique_number(&adj);
+            let alpha_comp = oracle.independence_number(&comp);
+            assert_eq!(omega, alpha_comp);
+        }
+    }
+
+    #[test]
+    fn oracle_base_cases_extended() {
+        const N: usize = 1;
+        let mut oracle = IndependentSetOracle::<N>::new();
+        let adj = [0u64; N];
+        assert!(oracle.has_independent_set_of_size(&adj, 1));
+        assert!(!oracle.has_independent_set_of_size(&adj, 2));
+        assert_eq!(oracle.independence_number(&adj), 1);
+        assert_eq!(oracle.clique_number(&adj), 1);
     }
 }

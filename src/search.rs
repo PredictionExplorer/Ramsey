@@ -1,7 +1,17 @@
 //! Parallel stochastic search driver (LAHC + SA hybrid with Tabu).
+//!
+//! Enhanced with:
+//! - Lazy IS witness pool for constraint learning
+//! - Coverage-based move selection (hitting-set style)
+//! - Portfolio search with heterogeneous island configurations
 
+use crate::construction::{construct_best_of, construct_initial, ConstructionStrategy};
+use crate::elite::ElitePool;
 use crate::graph::RamseyState;
 use crate::iset::{CachedIsOracle, IndependentSetOracle};
+use crate::moves::{apply_move, CompoundMoveGenerator, MoveType};
+use crate::portfolio::IslandConfig;
+use crate::witness::{SharedWitnessPool, WitnessPool};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
@@ -25,6 +35,22 @@ pub enum ForbiddenType {
     Clique,
 }
 
+/// How the search combines the forbidden-subgraph score (e.g., C4 score) and the independent-set
+/// violation score into a single scalar energy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectiveMode {
+    /// Traditional weighted sum: `energy = forbidden_score * c4_weight + is_count * is_penalty`.
+    WeightedSum,
+    /// Two-phase / lexicographic-in-spirit objective:
+    /// - When forbidden subgraphs exist: focus primarily on removing them (optionally still
+    ///   include a reduced IS penalty).
+    /// - Once forbidden subgraphs are eliminated: focus on eliminating IS violations.
+    ///
+    /// This prevents the search from getting stuck with a few remaining C4s because fixing them
+    /// temporarily increases IS violations.
+    TwoPhase,
+}
+
 /// Search configuration parameters.
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
@@ -44,6 +70,12 @@ pub struct SearchConfig {
     pub c4_weight: usize,
     /// Penalty added for IS violation.
     pub independent_violation_penalty: usize,
+    /// Objective mode (how we combine C4 vs IS violations).
+    pub objective_mode: ObjectiveMode,
+    /// In `TwoPhase` mode, the IS penalty used while forbidden subgraphs still exist.
+    ///
+    /// Set to 0 to fully prioritize eliminating forbidden subgraphs first.
+    pub is_penalty_when_forbidden_present: usize,
     /// LAHC history buffer length.
     pub lahc_size: usize,
     /// Starting temperature.
@@ -94,6 +126,41 @@ pub struct SearchConfig {
     pub elite_restart_perturb_strength: usize,
     /// Jitter applied to edge probability when generating a fresh random restart state.
     pub restart_p_jitter: f64,
+    /// Size of the elite pool for sharing solutions between workers.
+    pub elite_pool_size: usize,
+    /// Probability of sampling from elite pool during restart.
+    pub elite_sample_probability: f64,
+    /// Probability of using crossover when restarting from elite pool.
+    pub elite_crossover_probability: f64,
+    /// Probability of using compound moves instead of single edge flips.
+    pub compound_move_probability: f64,
+    /// Maximum depth for compound moves.
+    pub compound_move_depth: usize,
+    /// Number of attempts when constructing initial graph.
+    pub construction_attempts: usize,
+    /// Enable witness pool for lazy IS constraint learning.
+    pub use_witness_pool: bool,
+    /// Maximum size of local witness pool per worker.
+    pub witness_pool_size: usize,
+    /// Maximum size of shared witness pool across workers.
+    pub shared_witness_pool_size: usize,
+    /// How often to sync local witnesses to shared pool (iterations).
+    pub witness_sync_interval: u64,
+    /// Probability of using coverage-based move selection.
+    pub coverage_move_probability: f64,
+    /// Maximum C4s to allow when selecting coverage-based moves.
+    pub coverage_max_c4: usize,
+    /// Max number of edges to add in a single coverage-based move (multi-edge hitting-set move).
+    ///
+    /// This is only used when the current graph is C4-free; edges are selected to break as many
+    /// active witnesses as possible while preserving C4-freeness.
+    pub coverage_multi_edges: usize,
+    /// Number of top coverage candidate edges to consider when constructing a multi-edge move.
+    pub coverage_candidate_limit: usize,
+    /// Probability of attempting a multi-edge coverage move (vs a single-edge coverage move).
+    pub coverage_multi_probability: f64,
+    /// Enable portfolio (heterogeneous island) search.
+    pub use_portfolio: bool,
 }
 
 impl Default for SearchConfig {
@@ -112,6 +179,8 @@ impl Default for SearchConfig {
             edge_probability: 0.18,
             c4_weight: 50, // Increased to prioritize cycle removal more strongly
             independent_violation_penalty: 1,
+            objective_mode: ObjectiveMode::TwoPhase,
+            is_penalty_when_forbidden_present: 0,
             lahc_size: 1000,
             temp_start: 10.0, // Higher starting temp for better exploration
             cooling_rate: 0.999_999_7,
@@ -135,6 +204,24 @@ impl Default for SearchConfig {
             restart_from_scratch_probability: 0.5,
             elite_restart_perturb_strength: 200,
             restart_p_jitter: 0.03,
+            elite_pool_size: 50,
+            elite_sample_probability: 0.3,
+            elite_crossover_probability: 0.2,
+            compound_move_probability: 0.15,
+            compound_move_depth: 3,
+            construction_attempts: 10,
+            // New witness pool settings
+            use_witness_pool: true,
+            witness_pool_size: 200,
+            shared_witness_pool_size: 1000,
+            witness_sync_interval: 10_000,
+            coverage_move_probability: 0.6,
+            coverage_max_c4: 0, // Only C4-safe coverage moves
+            coverage_multi_edges: 3,
+            coverage_candidate_limit: 64,
+            coverage_multi_probability: 0.35,
+            // Portfolio search
+            use_portfolio: true,
         }
     }
 }
@@ -235,11 +322,47 @@ pub fn run_search<const N: usize>(cfg: &SearchConfig) {
         cfg.lahc_size.min(MAX_LAHC_SIZE),
         cfg.temp_start
     );
+    println!(
+        "Objective: {:?} | C4 weight: {} | IS penalty: {} (when forbidden present: {})",
+        cfg.objective_mode,
+        cfg.c4_weight,
+        cfg.independent_violation_penalty,
+        cfg.is_penalty_when_forbidden_present
+    );
+    println!(
+        "Elite Pool: size={} | Compound Moves: prob={:.2}",
+        cfg.elite_pool_size,
+        cfg.compound_move_probability
+    );
+    if cfg.use_witness_pool {
+        println!(
+            "Witness Pool: local={} shared={} | Coverage: prob={:.2}",
+            cfg.witness_pool_size,
+            cfg.shared_witness_pool_size,
+            cfg.coverage_move_probability
+        );
+    }
+    if cfg.use_portfolio {
+        println!("Portfolio: heterogeneous island configurations enabled");
+    }
     println!("--------------------------------------------------");
 
     let base_seed = cfg.seed.unwrap_or_else(random_u64);
     let found_flag = AtomicBool::new(false);
     let global_best_energy = AtomicUsize::new(usize::MAX);
+
+    // Create shared elite pool
+    let elite_pool = ElitePool::<N>::new(cfg.elite_pool_size);
+
+    // Create shared witness pool for cross-worker constraint learning
+    let shared_witnesses = SharedWitnessPool::new(cfg.shared_witness_pool_size, cfg.k_target);
+
+    // Create portfolio configurations if enabled
+    let island_configs = if cfg.use_portfolio {
+        IslandConfig::portfolio(cfg.chains)
+    } else {
+        vec![IslandConfig::default(); cfg.chains]
+    };
 
     let log_filename = format!("search_log_n{N}_k{}.csv", cfg.k_target);
     if let Ok(mut log_file) = std::fs::File::create(&log_filename) {
@@ -247,7 +370,17 @@ pub fn run_search<const N: usize>(cfg: &SearchConfig) {
     }
 
     (0..cfg.chains).into_par_iter().for_each(|worker_id| {
-        solve_worker::<N>(worker_id, base_seed, cfg, &found_flag, &global_best_energy);
+        let island_cfg = &island_configs[worker_id % island_configs.len()];
+        solve_worker::<N>(
+            worker_id,
+            base_seed,
+            cfg,
+            island_cfg,
+            &found_flag,
+            &global_best_energy,
+            &elite_pool,
+            &shared_witnesses,
+        );
     });
 }
 
@@ -255,24 +388,49 @@ pub fn run_search<const N: usize>(cfg: &SearchConfig) {
 // Worker
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn solve_worker<const N: usize>(
     worker_id: usize,
     base_seed: u64,
     cfg: &SearchConfig,
+    island_cfg: &IslandConfig,
     found_flag: &AtomicBool,
     global_best_energy: &AtomicUsize,
+    elite_pool: &ElitePool<N>,
+    shared_witnesses: &SharedWitnessPool,
 ) {
     if worker_id == 0 {
-        println!("[Worker 0] Starting search chain...");
+        println!("[Worker 0] Starting search chain (island: {})...", island_cfg.name);
     }
     let mut rng = SmallRng::seed_from_u64(splitmix64(base_seed ^ (worker_id as u64)));
-    let mut state = initialize_state::<N>(worker_id, &mut rng, cfg);
+    let mut state = initialize_state::<N>(worker_id, &mut rng, cfg, elite_pool);
     let mut oracle = IndependentSetOracle::<N>::new();
     let mut cached_oracle = CachedIsOracle::<N>::new();
     let mut scratch_set = Vec::<usize>::with_capacity(cfg.k_target.max(16));
-    let mut tabu = TabuList::new(cfg.tabu_size);
 
-    let mut temp = cfg.temp_start;
+    // Initialize local witness pool
+    let mut witness_pool = if cfg.use_witness_pool {
+        WitnessPool::new(cfg.witness_pool_size, cfg.k_target)
+    } else {
+        WitnessPool::new(0, cfg.k_target) // Disabled
+    };
+
+    // Seed local pool from shared pool
+    if cfg.use_witness_pool {
+        witness_pool.merge(&shared_witnesses.snapshot());
+    }
+    // Apply island-specific configuration
+    let effective_tabu_size = island_cfg.apply_tabu_size(cfg.tabu_size);
+    let effective_c4_weight = island_cfg.apply_c4_weight(cfg.c4_weight);
+    let effective_compound_prob = island_cfg.compound_move_prob;
+    let effective_temp_start = island_cfg.apply_temp(cfg.temp_start);
+    let effective_reheat_temp = island_cfg.apply_reheat_temp(cfg.reheat_temp);
+    let effective_kick_strength = island_cfg.apply_kick_strength(cfg.kick_strength);
+
+    let mut tabu = TabuList::new(effective_tabu_size);
+    let move_gen = CompoundMoveGenerator::<N>::new(effective_compound_prob, cfg.compound_move_depth);
+
+    let mut temp = effective_temp_start;
     let mut iterations: u64 = 0;
     let mut iters_since_best: u64 = 0;
     let mut last_csv_log_best = usize::MAX;
@@ -280,7 +438,19 @@ fn solve_worker<const N: usize>(
 
     let lahc_len = cfg.lahc_size.clamp(1, MAX_LAHC_SIZE);
     let mut lahc_history = [0usize; MAX_LAHC_SIZE];
-    let initial_energy = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg).energy;
+
+    // Create island-adjusted config for evaluation
+    let mut island_eval_cfg = cfg.clone();
+    island_eval_cfg.c4_weight = effective_c4_weight;
+
+    let initial_energy = evaluate_with_witnesses::<N>(
+        &state,
+        &mut oracle,
+        &mut cached_oracle,
+        &mut scratch_set,
+        &island_eval_cfg,
+        &mut witness_pool,
+    ).energy;
     global_best_energy.fetch_min(initial_energy, Ordering::Relaxed);
 
     let mut lahc_idx = 0usize;
@@ -297,29 +467,90 @@ fn solve_worker<const N: usize>(
         iterations += 1;
         iters_since_best += 1;
 
+        // Periodic witness pool maintenance
+        if cfg.use_witness_pool && iterations.is_multiple_of(cfg.witness_sync_interval) {
+            // Sync to shared pool
+            let local_witnesses = witness_pool.snapshot();
+            for w in &local_witnesses {
+                shared_witnesses.add(*w);
+            }
+            // Fetch new witnesses from shared pool
+            witness_pool.merge(&shared_witnesses.snapshot());
+            // Prune invalid witnesses
+            witness_pool.prune_invalid(state.adj());
+        }
+
         if iters_since_best >= cfg.kick_threshold {
             if worker_id == 0 {
                 println!("\n[Worker 0] Applying kick (threshold reached)");
             }
-            apply_kick::<N>(&mut state, &mut rng, &mut cached_oracle, &mut tabu, cfg);
-            current_energy =
-                evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg).energy;
+            apply_kick_with_strength::<N>(&mut state, &mut rng, &mut cached_oracle, &mut tabu, effective_kick_strength);
+            current_energy = evaluate_with_witnesses::<N>(
+                &state,
+                &mut oracle,
+                &mut cached_oracle,
+                &mut scratch_set,
+                &island_eval_cfg,
+                &mut witness_pool,
+            ).energy;
             iters_since_best = 0;
             continue;
         }
 
-        let (u, v) = propose_move_with_tabu::<N, _>(
-            &mut state,
+        // Generate move with witness-aware selection
+        let mv = if rng.random_bool(effective_compound_prob) {
+            move_gen.generate_compound_only(&state, &mut oracle, &mut rng, cfg.k_target)
+        } else if cfg.use_witness_pool
+            && island_cfg.use_coverage_moves
+            && state.c4_count() == 0
+            && rng.random_bool(cfg.coverage_move_probability)
+        {
+            // Use coverage-based move selection when C4-free
+            if let Some(mv) = propose_coverage_move::<N, _>(
+                &mut state,
+                &witness_pool,
+                &tabu,
+                &mut rng,
+                cfg,
+            ) {
+                mv
+            } else {
+                let (u, v) = propose_move_with_tabu::<N, _>(
+                    &mut state,
+                    &mut oracle,
+                    &mut cached_oracle,
+                    &mut scratch_set,
+                    &mut rng,
+                    &tabu,
+                    cfg,
+                );
+                MoveType::Single(u, v)
+            }
+        } else {
+            let (u, v) = propose_move_with_tabu::<N, _>(
+                &mut state,
+                &mut oracle,
+                &mut cached_oracle,
+                &mut scratch_set,
+                &mut rng,
+                &tabu,
+                cfg,
+            );
+            MoveType::Single(u, v)
+        };
+
+        // Apply move
+        apply_move(&mut state, &mv);
+        mv.for_each_edge(|u, v| cached_oracle.invalidate_edge(u, v));
+
+        let eval = evaluate_with_witnesses::<N>(
+            &state,
             &mut oracle,
             &mut cached_oracle,
             &mut scratch_set,
-            &mut rng,
-            &tabu,
-            cfg,
+            &island_eval_cfg,
+            &mut witness_pool,
         );
-        state.flip_edge(u, v);
-        cached_oracle.invalidate_edge(u, v);
-        let eval = evaluate::<N>(&state, &mut oracle, &mut cached_oracle, &mut scratch_set, cfg);
 
         if eval.is_solution {
             handle_success::<N>(worker_id, &state, cfg, found_flag);
@@ -333,6 +564,8 @@ fn solve_worker<const N: usize>(
             let old = global_best_energy.fetch_min(eval.energy, Ordering::Relaxed);
             if eval.energy < old {
                 let _ = state.save_to_file(format!("best_checkpoint_n{N}_k{}.txt", cfg.k_target));
+                // Submit to elite pool
+                elite_pool.try_add(state.clone(), eval.energy);
             }
         }
 
@@ -344,10 +577,11 @@ fn solve_worker<const N: usize>(
             &mut rng,
         ) {
             current_energy = eval.energy;
-            tabu.add(u, v);
+            mv.for_each_edge(|u, v| tabu.add(u, v));
         } else {
-            state.flip_edge(u, v);
-            cached_oracle.invalidate_edge(u, v);
+            // Revert move
+            apply_move(&mut state, &mv);
+            mv.for_each_edge(|u, v| cached_oracle.invalidate_edge(u, v));
         }
 
         lahc_history[lahc_idx] = current_energy;
@@ -358,7 +592,7 @@ fn solve_worker<const N: usize>(
             // Cold + stagnant => restart (state-of-the-art multi-start diversification).
             //
             // We check BEFORE reheating so a true "cold" state can trigger a restart.
-            if maybe_cold_restart::<N>(
+            if maybe_cold_restart_with_witnesses::<N>(
                 &mut temp,
                 &mut iters_since_best,
                 &mut state,
@@ -373,6 +607,10 @@ fn solve_worker<const N: usize>(
                 &mut lahc_idx,
                 &mut current_energy,
                 cfg,
+                &island_eval_cfg,
+                elite_pool,
+                &mut witness_pool,
+                effective_temp_start,
             ) {
                 if worker_id == 0 {
                     println!("\n[Worker 0] Cold restart triggered!");
@@ -381,7 +619,7 @@ fn solve_worker<const N: usize>(
                 if worker_id == 0 {
                     println!("\n[Worker 0] Reheating...");
                 }
-                temp = cfg.reheat_temp;
+                temp = effective_reheat_temp;
             }
             if worker_id == 0 && iterations.is_multiple_of(cfg.report_every) {
                 last_csv_log_best = report_progress::<N>(
@@ -412,6 +650,8 @@ fn reinitialize_lahc(
     *lahc_idx = 0;
 }
 
+/// Apply kick perturbation (legacy interface).
+#[allow(dead_code)]
 #[inline]
 fn apply_kick<const N: usize>(
     state: &mut RamseyState<N>,
@@ -429,6 +669,8 @@ fn apply_kick<const N: usize>(
     cached_oracle.clear_cache();
 }
 
+/// Cold restart without witness pool (legacy interface).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn maybe_cold_restart<const N: usize>(
     temp: &mut f64,
@@ -445,6 +687,7 @@ fn maybe_cold_restart<const N: usize>(
     lahc_idx: &mut usize,
     current_energy: &mut usize,
     cfg: &SearchConfig,
+    elite_pool: &ElitePool<N>,
 ) -> bool {
     if !(cfg.enable_cold_restarts
         && *temp < cfg.cold_restart_temp
@@ -453,16 +696,47 @@ fn maybe_cold_restart<const N: usize>(
         return false;
     }
 
-    let from_scratch =
-        rng.random_bool(cfg.restart_from_scratch_probability.clamp(0.0, 1.0));
-    if from_scratch {
-        let p = jitter_probability(rng, cfg.edge_probability, cfg.restart_p_jitter);
-        *state = RamseyState::<N>::new_random(rng, p);
-    } else {
-        *state = elite_state.clone();
-        for _ in 0..cfg.elite_restart_perturb_strength {
-            let (u, v) = random_pair::<N, _>(rng);
-            state.flip_edge(u, v);
+    // Choose restart strategy
+    let strategy = rng.random_range(0..4);
+    match strategy {
+        0 => {
+            // Restart from scratch
+            let p = jitter_probability(rng, cfg.edge_probability, cfg.restart_p_jitter);
+            *state = RamseyState::<N>::new_random(rng, p);
+        }
+        1 => {
+            // Restart from elite pool (if available)
+            if let Some(elite) = elite_pool.sample_diverse(rng, state) {
+                *state = elite;
+            } else {
+                *state = elite_state.clone();
+            }
+            // Apply perturbation
+            for _ in 0..cfg.elite_restart_perturb_strength / 2 {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
+        }
+        2 => {
+            // Crossover from elite pool
+            if let Some(child) = elite_pool.crossover(rng) {
+                *state = child;
+            } else {
+                *state = elite_state.clone();
+            }
+            // Light perturbation
+            for _ in 0..cfg.elite_restart_perturb_strength / 4 {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
+        }
+        _ => {
+            // Restart from worker's own elite with strong perturbation
+            *state = elite_state.clone();
+            for _ in 0..cfg.elite_restart_perturb_strength {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
         }
     }
 
@@ -478,19 +752,46 @@ fn maybe_cold_restart<const N: usize>(
     true
 }
 
-fn initialize_state<const N: usize>(worker_id: usize, rng: &mut SmallRng, cfg: &SearchConfig) -> RamseyState<N> {
+fn initialize_state<const N: usize>(
+    worker_id: usize,
+    rng: &mut SmallRng,
+    cfg: &SearchConfig,
+    elite_pool: &ElitePool<N>,
+) -> RamseyState<N> {
+    // Try to resume from file if specified
     if let Some(path) = &cfg.resume_path {
         match RamseyState::<N>::load_from_file(path) {
-            Ok(s) => s,
+            Ok(s) => return s,
             Err(e) => {
-                if worker_id == 0 { eprintln!("Warning: Failed to load resume file: {e}. Starting fresh."); }
-                let p = jitter_probability(rng, cfg.edge_probability, cfg.initial_p_jitter);
-                RamseyState::<N>::new_random(rng, p)
+                if worker_id == 0 {
+                    eprintln!("Warning: Failed to load resume file: {e}. Starting fresh.");
+                }
             }
         }
+    }
+
+    // Try sampling from elite pool
+    if rng.random_bool(cfg.elite_sample_probability) {
+        if let Some(elite) = elite_pool.sample(rng) {
+            // Optionally crossover with another elite
+            if rng.random_bool(cfg.elite_crossover_probability) {
+                if let Some(child) = elite_pool.crossover(rng) {
+                    return child;
+                }
+            }
+            return elite;
+        }
+    }
+
+    // Use varied construction strategies for diversity
+    let strategies = ConstructionStrategy::all();
+    let strategy = strategies[worker_id % strategies.len()];
+    let p = jitter_probability(rng, cfg.edge_probability, cfg.initial_p_jitter);
+
+    if cfg.construction_attempts > 1 {
+        construct_best_of::<N, _>(rng, p, cfg.construction_attempts)
     } else {
-        let p = jitter_probability(rng, cfg.edge_probability, cfg.initial_p_jitter);
-        RamseyState::<N>::new_random(rng, p)
+        construct_initial::<N, _>(rng, strategy, p)
     }
 }
 
@@ -543,10 +844,25 @@ struct Eval {
     is_solution: bool,
 }
 
-/// Staged evaluation:
+#[inline]
+fn is_penalty_for<const N: usize>(cfg: &SearchConfig, forbidden_score: usize) -> usize {
+    match cfg.objective_mode {
+        ObjectiveMode::WeightedSum => cfg.independent_violation_penalty,
+        ObjectiveMode::TwoPhase => {
+            if forbidden_score == 0 {
+                cfg.independent_violation_penalty
+            } else {
+                cfg.is_penalty_when_forbidden_present
+            }
+        }
+    }
+}
+
+/// Staged evaluation (legacy interface without witness pool).
 /// - Uses the incremental C4 score if target is C4.
 /// - Otherwise uses the oracle for general cliques/cycles.
 /// - Uses cached oracle for IS detection.
+#[allow(dead_code)]
 #[inline]
 fn evaluate<const N: usize>(
     state: &RamseyState<N>,
@@ -569,12 +885,16 @@ fn evaluate<const N: usize>(
     };
 
     // 2. Calculate Independent Set Energy (Gradient)
-    // We always count IS to provide a gradient, even if forbidden subgraphs exist.
-    // We use a higher limit to provide better resolution for the metaheuristic.
-    let is_limit = 500;
-    let is_count = cached_oracle.count_independent_sets_of_size(state.adj(), cfg.k_target, is_limit);
+    let is_penalty = is_penalty_for::<N>(cfg, forbidden_score);
+    let is_count = if is_penalty == 0 {
+        0
+    } else {
+        // We use a higher limit to provide better resolution for the metaheuristic.
+        let is_limit = 500;
+        cached_oracle.count_independent_sets_of_size(state.adj(), cfg.k_target, is_limit)
+    };
 
-    let energy = forbidden_score * cfg.c4_weight + is_count;
+    let energy = forbidden_score * cfg.c4_weight + is_count * is_penalty;
 
     Eval {
         energy,
@@ -582,9 +902,287 @@ fn evaluate<const N: usize>(
     }
 }
 
+/// Enhanced evaluation using witness pool for lazy IS constraint checking.
+///
+/// Key difference from evaluate():
+/// - First checks cached witnesses (O(k²) per witness)
+/// - Only calls expensive oracle when necessary
+/// - Learns new witnesses for future use
+#[inline]
+fn evaluate_with_witnesses<const N: usize>(
+    state: &RamseyState<N>,
+    oracle: &mut IndependentSetOracle<N>,
+    cached_oracle: &mut CachedIsOracle<N>,
+    scratch_set: &mut Vec<usize>,
+    cfg: &SearchConfig,
+    witness_pool: &mut WitnessPool,
+) -> Eval {
+    // 1. Calculate Forbidden Subgraph Energy
+    let forbidden_score = match (cfg.forbidden_type, cfg.c_target) {
+        (ForbiddenType::Cycle, 4) => state.c4_score_twice(),
+        (ForbiddenType::Clique, c) => oracle.count_cliques_of_size(state.adj(), c, 100),
+        (ForbiddenType::Cycle, c) => {
+            if c == 3 {
+                oracle.count_cliques_of_size(state.adj(), 3, 100)
+            } else {
+                panic!("Unsupported cycle length {c}. Only C3 and C4 are currently implemented.");
+            }
+        }
+    };
+
+    // 2. Calculate IS energy using witness pool (lazy constraint checking)
+    let is_penalty = is_penalty_for::<N>(cfg, forbidden_score);
+
+    if is_penalty == 0 {
+        // Two-phase objective: while forbidden subgraphs exist, we can entirely ignore IS work.
+        // This is both faster and prevents IS penalties from blocking progress on C4 removal.
+        return Eval {
+            energy: forbidden_score * cfg.c4_weight,
+            is_solution: false,
+        };
+    }
+
+    // First, count how many cached witnesses are still valid (cheap)
+    let cached_valid = witness_pool.count_valid(state.adj());
+
+    // If we have cached witnesses that are valid, use that count
+    // Otherwise, do a limited exact check
+    let is_count = if cached_valid > 0 {
+        // We know there are at least this many IS violations
+        cached_valid
+    } else {
+        // No cached witnesses are valid; try to find new ones
+        // Use a lower limit since we're doing this more often
+        let limit = 50;
+        let exact_count = cached_oracle.count_independent_sets_of_size(state.adj(), cfg.k_target, limit);
+
+        // If we found any, try to cache them as witnesses
+        if exact_count > 0 {
+            scratch_set.clear();
+            if cached_oracle.find_independent_set_of_size(state.adj(), cfg.k_target, scratch_set) {
+                witness_pool.add_from_vertices(scratch_set);
+            }
+        }
+
+        exact_count
+    };
+
+    let energy = forbidden_score * cfg.c4_weight + is_count * is_penalty;
+
+    // A solution requires both constraints to be satisfied
+    let is_solution = if forbidden_score == 0 && is_count == 0 {
+        // Double-check with exact oracle before declaring victory
+        scratch_set.clear();
+        !oracle.has_independent_set_of_size(state.adj(), cfg.k_target)
+    } else {
+        false
+    };
+
+    Eval { energy, is_solution }
+}
+
+/// Apply kick with configurable strength.
+#[inline]
+fn apply_kick_with_strength<const N: usize>(
+    state: &mut RamseyState<N>,
+    rng: &mut SmallRng,
+    cached_oracle: &mut CachedIsOracle<N>,
+    tabu: &mut TabuList,
+    strength: usize,
+) {
+    for _ in 0..strength {
+        let (u, v) = random_pair::<N, _>(rng);
+        state.flip_edge(u, v);
+        cached_oracle.invalidate_edge(u, v);
+    }
+    tabu.clear();
+    cached_oracle.clear_cache();
+}
+
+/// Cold restart with witness pool support.
+#[allow(clippy::too_many_arguments)]
+fn maybe_cold_restart_with_witnesses<const N: usize>(
+    temp: &mut f64,
+    iters_since_best: &mut u64,
+    state: &mut RamseyState<N>,
+    elite_state: &RamseyState<N>,
+    rng: &mut SmallRng,
+    oracle: &mut IndependentSetOracle<N>,
+    cached_oracle: &mut CachedIsOracle<N>,
+    scratch_set: &mut Vec<usize>,
+    tabu: &mut TabuList,
+    lahc_history: &mut [usize; MAX_LAHC_SIZE],
+    lahc_len: usize,
+    lahc_idx: &mut usize,
+    current_energy: &mut usize,
+    cfg: &SearchConfig,
+    island_eval_cfg: &SearchConfig,
+    elite_pool: &ElitePool<N>,
+    witness_pool: &mut WitnessPool,
+    effective_temp_start: f64,
+) -> bool {
+    if !(cfg.enable_cold_restarts
+        && *temp < cfg.cold_restart_temp
+        && *iters_since_best >= cfg.cold_restart_patience)
+    {
+        return false;
+    }
+
+    // Choose restart strategy
+    let strategy = rng.random_range(0..4);
+    match strategy {
+        0 => {
+            // Restart from scratch
+            let p = jitter_probability(rng, cfg.edge_probability, cfg.restart_p_jitter);
+            *state = RamseyState::<N>::new_random(rng, p);
+        }
+        1 => {
+            // Restart from elite pool (if available)
+            if let Some(elite) = elite_pool.sample_diverse(rng, state) {
+                *state = elite;
+            } else {
+                *state = elite_state.clone();
+            }
+            // Apply perturbation
+            for _ in 0..cfg.elite_restart_perturb_strength / 2 {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
+        }
+        2 => {
+            // Crossover from elite pool
+            if let Some(child) = elite_pool.crossover(rng) {
+                *state = child;
+            } else {
+                *state = elite_state.clone();
+            }
+            // Light perturbation
+            for _ in 0..cfg.elite_restart_perturb_strength / 4 {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
+        }
+        _ => {
+            // Restart from worker's own elite with strong perturbation
+            *state = elite_state.clone();
+            for _ in 0..cfg.elite_restart_perturb_strength {
+                let (u, v) = random_pair::<N, _>(rng);
+                state.flip_edge(u, v);
+            }
+        }
+    }
+
+    tabu.clear();
+    cached_oracle.clear_cache();
+    scratch_set.clear();
+
+    // Prune witness pool after restart
+    witness_pool.prune_invalid(state.adj());
+
+    let restarted_energy = evaluate_with_witnesses::<N>(
+        state,
+        oracle,
+        cached_oracle,
+        scratch_set,
+        island_eval_cfg,
+        witness_pool,
+    ).energy;
+    *current_energy = restarted_energy;
+    reinitialize_lahc(lahc_history, lahc_len, restarted_energy, lahc_idx);
+    *temp = effective_temp_start;
+    *iters_since_best = 0;
+    true
+}
+
 // ============================================================================
 // Move proposal with Tabu and Degree Bias
 // ============================================================================
+
+/// Proposes a witness-coverage move in a C4-free state.
+///
+/// - Picks edges (non-edges to add) that break many currently-valid witnesses.
+/// - Optionally chains multiple such edges into a single `MoveType::Multi` move (greedy hitting-set),
+///   which can eliminate many violations in one step.
+///
+/// Returns `None` if there are no valid witnesses (or no non-tabu witness-breaking edges).
+#[inline]
+fn propose_coverage_move<const N: usize, R: Rng>(
+    state: &mut RamseyState<N>,
+    witness_pool: &WitnessPool,
+    tabu: &TabuList,
+    rng: &mut R,
+    cfg: &SearchConfig,
+) -> Option<MoveType> {
+    debug_assert!(state.c4_count() == 0, "coverage moves are intended for C4-free states");
+    debug_assert!(cfg.use_witness_pool);
+
+    let max_edges = cfg.coverage_multi_edges.clamp(1, 16);
+    let want_multi = max_edges >= 2 && rng.random_bool(cfg.coverage_multi_probability);
+
+    if !want_multi {
+        let candidates =
+            witness_pool.edges_by_coverage::<N>(state.adj(), cfg.coverage_max_c4, cfg.coverage_candidate_limit);
+        for (edge, hits, _c4) in candidates {
+            if hits == 0 {
+                continue;
+            }
+            let (u, v) = edge;
+            if !tabu.is_tabu(u, v) {
+                return Some(MoveType::Single(u, v));
+            }
+        }
+        return None;
+    }
+
+    // Greedy hitting-set: repeatedly add the best coverage edge in the *current* temporary state.
+    //
+    // We mutate `state` temporarily: each added edge breaks (invalidates) all witnesses that contain it,
+    // so the next selection round naturally targets remaining violations.
+    let mut selected: Vec<(usize, usize)> = Vec::with_capacity(max_edges);
+
+    for _ in 0..max_edges {
+        let candidates =
+            witness_pool.edges_by_coverage::<N>(state.adj(), cfg.coverage_max_c4, cfg.coverage_candidate_limit);
+
+        let mut picked = None;
+        for (edge, hits, _c4) in candidates {
+            if hits == 0 {
+                continue;
+            }
+            let (u, v) = edge;
+            if tabu.is_tabu(u, v) {
+                continue;
+            }
+            picked = Some((u, v));
+            break;
+        }
+
+        let Some((u, v)) = picked else {
+            break;
+        };
+
+        // Apply edge (temporarily) to update witness validity for the next iteration.
+        state.flip_edge(u, v);
+        selected.push((u, v));
+
+        // With strict C4-safe filtering (`coverage_max_c4 == 0`) this should remain C4-free.
+        debug_assert!(
+            cfg.coverage_max_c4 != 0 || state.c4_count() == 0,
+            "coverage move introduced a C4 despite strict filtering"
+        );
+    }
+
+    // Revert temporary mutations so caller can apply/reject the returned move normally.
+    for &(u, v) in &selected {
+        state.flip_edge(u, v);
+    }
+
+    match selected.len() {
+        0 => None,
+        1 => Some(MoveType::Single(selected[0].0, selected[0].1)),
+        _ => Some(MoveType::Multi(selected)),
+    }
+}
 
 #[inline]
 fn propose_move_with_tabu<const N: usize, R: Rng>(
@@ -650,12 +1248,26 @@ fn propose_guided_move<const N: usize, R: Rng>(
         if rng.random_bool(c4_focus_prob) {
             // Try to remove a C4
             if c4_count <= 5 {
-                let edges = state.find_c4_edges(10);
-                if !edges.is_empty() {
-                    return Some(edges[rng.random_range(0..edges.len())]);
+                // Near-feasible: evaluate a small candidate set and remove the edge
+                // that gives the biggest C4 score drop (best delta).
+                let edges = state.find_c4_edges(32);
+                let mut best = None;
+                let mut best_delta = 0isize; // More negative is better
+                for (u, v) in edges {
+                    if !state.has_edge(u, v) {
+                        continue;
+                    }
+                    let delta = state.c4_delta_if_remove(u, v);
+                    if best.is_none() || delta < best_delta {
+                        best = Some((u, v));
+                        best_delta = delta;
+                    }
+                }
+                if let Some(edge) = best {
+                    return Some(edge);
                 }
             }
-            if let Some(edge) = state.sample_c4_edge_to_remove(rng, cfg.c4_probe_tries) {
+            if let Some(edge) = best_c4_edge_to_remove(state, rng, cfg.c4_probe_tries) {
                 return Some(edge);
             }
         }
@@ -717,6 +1329,43 @@ fn propose_guided_move<const N: usize, R: Rng>(
     }
 
     None
+}
+
+/// Samples multiple C4 edges and returns the one with the best (most negative) C4 delta if removed.
+///
+/// This is a higher-quality "repair" move than removing a random C4 edge and helps break
+/// through plateaus where the last few C4s are hard to remove due to competing pressures.
+#[inline]
+fn best_c4_edge_to_remove<const N: usize, R: Rng>(
+    state: &RamseyState<N>,
+    rng: &mut R,
+    samples: usize,
+) -> Option<(usize, usize)> {
+    if state.c4_score_twice() == 0 {
+        return None;
+    }
+    let outer = samples.clamp(1, 512);
+    let inner_tries = 16;
+
+    let mut best = None;
+    let mut best_delta = 0isize; // More negative is better
+
+    for _ in 0..outer {
+        let Some((u, v)) = state.sample_c4_edge_to_remove(rng, inner_tries) else {
+            continue;
+        };
+        let delta = state.c4_delta_if_remove(u, v);
+        if best.is_none() || delta < best_delta {
+            best = Some((u, v));
+            best_delta = delta;
+        }
+        // Early exit: extremely good move (heuristic). In practice, deltas are negative.
+        if best_delta <= -64 {
+            break;
+        }
+    }
+
+    best
 }
 
 /// Select a vertex pair biased by degree (higher degree = more likely to be involved).
@@ -859,6 +1508,7 @@ fn splitmix64(mut x: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::iset::CachedIsOracle;
+    use crate::witness::Witness;
 
     #[test]
     fn splitmix64_is_deterministic() {
@@ -1165,6 +1815,7 @@ mod tests {
         let mut current_energy = 999_999usize;
         let mut temp = 0.1;
         let mut iters_since_best = 1;
+        let elite_pool = ElitePool::<N>::new(10);
 
         let did_restart = maybe_cold_restart::<N>(
             &mut temp,
@@ -1181,6 +1832,7 @@ mod tests {
             &mut lahc_idx,
             &mut current_energy,
             &cfg,
+            &elite_pool,
         );
 
         assert!(did_restart);
@@ -1230,5 +1882,123 @@ mod tests {
             let res = jitter_probability(&mut rng, p, jitter);
             assert!((0.0..=1.0).contains(&res));
         }
+    }
+
+    #[test]
+    fn objective_mode_two_phase_ignores_is_when_forbidden_present() {
+        // 4-cycle graph: 0-1-2-3-0 has forbidden_score > 0.
+        let mut adj = [0u64; 4];
+        for (u, v) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+            adj[u] |= 1u64 << v;
+            adj[v] |= 1u64 << u;
+        }
+        let state = RamseyState::<4>::from_adj(adj);
+        assert!(state.c4_score_twice() > 0);
+
+        let mut oracle = IndependentSetOracle::<4>::new();
+        let mut cached_oracle = CachedIsOracle::<4>::new();
+        let mut scratch = Vec::new();
+
+        let mut witness_pool = WitnessPool::new(32, 2);
+        witness_pool.add(Witness::from_vertices(&[0, 2])); // valid IS of size 2 in C4
+
+        let mut cfg = SearchConfig::default();
+        cfg.k_target = 2;
+        cfg.c4_weight = 50;
+        cfg.independent_violation_penalty = 7;
+
+        // WeightedSum: includes IS penalty even when forbidden present.
+        cfg.objective_mode = ObjectiveMode::WeightedSum;
+        let weighted = evaluate_with_witnesses::<4>(
+            &state,
+            &mut oracle,
+            &mut cached_oracle,
+            &mut scratch,
+            &cfg,
+            &mut witness_pool,
+        );
+        let forbidden = state.c4_score_twice();
+        assert_eq!(weighted.energy, forbidden * cfg.c4_weight + 1 * cfg.independent_violation_penalty);
+
+        // TwoPhase with 0 penalty: ignores IS while forbidden present.
+        cfg.objective_mode = ObjectiveMode::TwoPhase;
+        cfg.is_penalty_when_forbidden_present = 0;
+        let two_phase = evaluate_with_witnesses::<4>(
+            &state,
+            &mut oracle,
+            &mut cached_oracle,
+            &mut scratch,
+            &cfg,
+            &mut witness_pool,
+        );
+        assert_eq!(two_phase.energy, forbidden * cfg.c4_weight);
+        assert!(!two_phase.is_solution);
+    }
+
+    #[test]
+    fn coverage_multi_move_can_return_multi_and_preserves_c4_free() {
+        use crate::moves::apply_move;
+
+        let mut state = RamseyState::<6>::empty();
+        assert_eq!(state.c4_score_twice(), 0);
+
+        // Three disjoint witnesses (size 2) in an empty graph.
+        let mut wp = WitnessPool::new(32, 2);
+        assert!(wp.add(Witness::from_vertices(&[0, 1])));
+        assert!(wp.add(Witness::from_vertices(&[2, 3])));
+        assert!(wp.add(Witness::from_vertices(&[4, 5])));
+
+        let tabu = TabuList::new(0);
+        let mut rng = SmallRng::seed_from_u64(123);
+
+        let mut cfg = SearchConfig::default();
+        cfg.use_witness_pool = true;
+        cfg.coverage_max_c4 = 0;
+        cfg.coverage_multi_edges = 3;
+        cfg.coverage_candidate_limit = 64;
+        cfg.coverage_multi_probability = 1.0; // force multi
+
+        let mv = propose_coverage_move::<6, _>(&mut state, &wp, &tabu, &mut rng, &cfg)
+            .expect("should propose a coverage move");
+
+        // Proposer must not mutate the caller state.
+        assert_eq!(state.edge_count(), 0);
+        assert_eq!(state.c4_score_twice(), 0);
+
+        // Should be a multi-edge move containing exactly the three witness pairs.
+        let edges = match mv {
+            MoveType::Multi(es) => es,
+            other => panic!("expected MoveType::Multi, got {other:?}"),
+        };
+        assert_eq!(edges.len(), 3);
+        let mut got = edges.clone();
+        got.sort();
+        let mut expected = vec![(0, 1), (2, 3), (4, 5)];
+        expected.sort();
+        assert_eq!(got, expected);
+
+        // Applying the multi-edge move should keep the graph C4-free (strict mode).
+        apply_move(&mut state, &MoveType::Multi(edges));
+        assert_eq!(state.c4_score_twice(), 0);
+    }
+
+    #[test]
+    fn best_c4_edge_to_remove_returns_improving_edge() {
+        // Two overlapping C4s: square 0-1-2-3-0 plus diagonals? We'll keep it simple:
+        // K_{2,2} on {0,1} x {2,3} has a C4 (0-2-1-3-0).
+        let mut adj = [0u64; 4];
+        for (u, v) in [(0, 2), (0, 3), (1, 2), (1, 3)] {
+            adj[u] |= 1u64 << v;
+            adj[v] |= 1u64 << u;
+        }
+        let state = RamseyState::<4>::from_adj(adj);
+        assert!(state.c4_score_twice() > 0);
+
+        let mut rng = SmallRng::seed_from_u64(999);
+        let edge = best_c4_edge_to_remove::<4, _>(&state, &mut rng, 128)
+            .expect("should find some C4 edge");
+        assert!(state.has_edge(edge.0, edge.1));
+        let delta = state.c4_delta_if_remove(edge.0, edge.1);
+        assert!(delta < 0, "removing returned edge should reduce C4 score");
     }
 }

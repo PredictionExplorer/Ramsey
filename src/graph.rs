@@ -184,6 +184,143 @@ impl<const N: usize> RamseyState<N> {
         self.common_neighbors[u][v]
     }
 
+    /// Returns a reference to the common neighbors matrix.
+    #[inline(always)]
+    pub fn common_neighbors(&self) -> &[[u8; N]; N] {
+        &self.common_neighbors
+    }
+
+    /// Computes the C4 delta for adding edge (u,v) WITHOUT modifying state.
+    ///
+    /// Returns the change in c4_score_twice that would occur if edge (u,v) were added.
+    /// Positive means more C4s would be created.
+    ///
+    /// This is O(deg(u) + deg(v)) but avoids the overhead of flip + cache invalidation + unflip.
+    #[inline]
+    pub fn c4_delta_if_add(&self, u: usize, v: usize) -> isize {
+        debug_assert!(u < N && v < N && u != v);
+        debug_assert!(!self.has_edge(u, v), "Edge already exists");
+
+        let neighbors_u = self.adj[u];
+        let neighbors_v = self.adj[v];
+        let u_mask = bit(u);
+        let v_mask = bit(v);
+
+        let mut delta: isize = 0;
+
+        // When adding (u,v):
+        // - For each w in N(v) \ {u}: common[u][w] increases by 1
+        // - For each w in N(u) \ {v}: common[v][w] increases by 1
+        // Delta to c4_score_twice for increasing common[x][y] from old to old+1 is: old
+
+        let mut t = neighbors_v & !u_mask;
+        while t != 0 {
+            let w = t.trailing_zeros() as usize;
+            t &= t - 1;
+            delta += self.common_neighbors[u][w] as isize;
+        }
+
+        let mut t = neighbors_u & !v_mask;
+        while t != 0 {
+            let w = t.trailing_zeros() as usize;
+            t &= t - 1;
+            delta += self.common_neighbors[v][w] as isize;
+        }
+
+        delta
+    }
+
+    /// Computes the C4 delta for removing edge (u,v) WITHOUT modifying state.
+    ///
+    /// Returns the change in c4_score_twice that would occur if edge (u,v) were removed.
+    /// Negative means fewer C4s (improvement).
+    #[inline]
+    pub fn c4_delta_if_remove(&self, u: usize, v: usize) -> isize {
+        debug_assert!(u < N && v < N && u != v);
+        debug_assert!(self.has_edge(u, v), "Edge doesn't exist");
+
+        let neighbors_u = self.adj[u];
+        let neighbors_v = self.adj[v];
+        let u_mask = bit(u);
+        let v_mask = bit(v);
+
+        let mut delta: isize = 0;
+
+        // When removing (u,v):
+        // - For each w in N(v) \ {u}: common[u][w] decreases by 1
+        // - For each w in N(u) \ {v}: common[v][w] decreases by 1
+        // Delta to c4_score_twice for decreasing common[x][y] from old to old-1 is: -(old-1)
+
+        let mut t = neighbors_v & !u_mask;
+        while t != 0 {
+            let w = t.trailing_zeros() as usize;
+            t &= t - 1;
+            let old = self.common_neighbors[u][w] as isize;
+            delta -= old - 1;
+        }
+
+        let mut t = neighbors_u & !v_mask;
+        while t != 0 {
+            let w = t.trailing_zeros() as usize;
+            t &= t - 1;
+            let old = self.common_neighbors[v][w] as isize;
+            delta -= old - 1;
+        }
+
+        delta
+    }
+
+    /// Computes the C4 delta for flipping edge (u,v) WITHOUT modifying state.
+    #[inline]
+    pub fn c4_delta_if_flip(&self, u: usize, v: usize) -> isize {
+        if self.has_edge(u, v) {
+            self.c4_delta_if_remove(u, v)
+        } else {
+            self.c4_delta_if_add(u, v)
+        }
+    }
+
+    /// Returns true if adding edge (u,v) would create zero new C4s.
+    ///
+    /// This checks that all affected common neighbor pairs have count 0,
+    /// meaning no new choose2 contributions would be added.
+    #[inline]
+    pub fn is_c4_safe_to_add(&self, u: usize, v: usize) -> bool {
+        debug_assert!(u < N && v < N && u != v);
+        // The delta is 0 iff for all w in N(v): common[u][w] = 0
+        // AND for all w in N(u): common[v][w] = 0
+        self.c4_delta_if_add(u, v) == 0
+    }
+
+    /// Returns all non-edges that are C4-safe to add.
+    ///
+    /// This is useful for restricting moves to only feasibility-preserving ones.
+    pub fn c4_safe_non_edges(&self) -> Vec<(usize, usize)> {
+        let mut result = Vec::new();
+        for u in 0..N {
+            for v in (u + 1)..N {
+                if !self.has_edge(u, v) && self.is_c4_safe_to_add(u, v) {
+                    result.push((u, v));
+                }
+            }
+        }
+        result
+    }
+
+    /// Returns the count of C4-safe non-edges.
+    #[inline]
+    pub fn c4_safe_non_edge_count(&self) -> usize {
+        let mut count = 0;
+        for u in 0..N {
+            for v in (u + 1)..N {
+                if !self.has_edge(u, v) && self.is_c4_safe_to_add(u, v) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Flips an edge and incrementally updates the C4 score in `O(deg(u)+deg(v))`.
     ///
     /// # Panics
@@ -872,8 +1009,11 @@ mod tests {
     // Invariant validation tests
     // -------------------------------------------------------------------------
 
+    // These tests only run in debug mode because release mode uses panic = "abort"
+    // which prevents the test harness from catching panics.
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn from_adj_panics_on_self_loop() {
         let mut adj = [0u64; 4];
         adj[0] = 0b0001; // Edge 0-0
@@ -882,6 +1022,7 @@ mod tests {
 
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn from_adj_panics_on_asymmetry() {
         let mut adj = [0u64; 4];
         adj[0] = 0b0010; // 0-1
@@ -1054,5 +1195,168 @@ mod tests {
         assert_eq!(all_bits::<1>(), 1);
         assert_eq!(all_bits::<32>(), 0xFFFF_FFFF);
         assert_eq!(all_bits::<64>(), u64::MAX);
+    }
+
+    // -------------------------------------------------------------------------
+    // Delta computation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn c4_delta_if_add_matches_actual() {
+        const N: usize = 12;
+        let mut rng = XorShiftRng::seed_from_u64(0xDE17A);
+
+        for _ in 0..500 {
+            let mut state = RamseyState::<N>::new_random(&mut rng, 0.3);
+
+            // Find a non-edge
+            let mut u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u || state.has_edge(u, v) {
+                u = rng.random_range(0..N);
+                v = rng.random_range(0..N);
+            }
+
+            let c4_before = state.c4_score_twice();
+            let predicted_delta = state.c4_delta_if_add(u, v);
+
+            state.flip_edge(u, v); // Add the edge
+            let c4_after = state.c4_score_twice();
+            let actual_delta = c4_after as isize - c4_before as isize;
+
+            assert_eq!(
+                predicted_delta, actual_delta,
+                "Delta mismatch for adding ({u}, {v}): predicted {predicted_delta}, actual {actual_delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_delta_if_remove_matches_actual() {
+        const N: usize = 12;
+        let mut rng = XorShiftRng::seed_from_u64(0xDE17A2);
+
+        for _ in 0..500 {
+            let mut state = RamseyState::<N>::new_random(&mut rng, 0.4);
+
+            // Find an existing edge
+            let mut u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u || !state.has_edge(u, v) {
+                u = rng.random_range(0..N);
+                v = rng.random_range(0..N);
+            }
+
+            let c4_before = state.c4_score_twice();
+            let predicted_delta = state.c4_delta_if_remove(u, v);
+
+            state.flip_edge(u, v); // Remove the edge
+            let c4_after = state.c4_score_twice();
+            let actual_delta = c4_after as isize - c4_before as isize;
+
+            assert_eq!(
+                predicted_delta, actual_delta,
+                "Delta mismatch for removing ({u}, {v}): predicted {predicted_delta}, actual {actual_delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_delta_if_flip_matches_actual() {
+        const N: usize = 15;
+        let mut rng = XorShiftRng::seed_from_u64(0xF11B);
+
+        for _ in 0..1000 {
+            let mut state = RamseyState::<N>::new_random(&mut rng, 0.35);
+
+            let u = rng.random_range(0..N);
+            let mut v = rng.random_range(0..N);
+            while v == u {
+                v = rng.random_range(0..N);
+            }
+
+            let c4_before = state.c4_score_twice();
+            let predicted_delta = state.c4_delta_if_flip(u, v);
+
+            state.flip_edge(u, v);
+            let c4_after = state.c4_score_twice();
+            let actual_delta = c4_after as isize - c4_before as isize;
+
+            assert_eq!(
+                predicted_delta, actual_delta,
+                "Delta mismatch for flipping ({u}, {v})"
+            );
+        }
+    }
+
+    #[test]
+    fn is_c4_safe_to_add_correct() {
+        const N: usize = 8;
+        let mut rng = XorShiftRng::seed_from_u64(0x5AFE);
+
+        for _ in 0..100 {
+            let state = RamseyState::<N>::new_random(&mut rng, 0.3);
+
+            for u in 0..N {
+                for v in (u + 1)..N {
+                    if state.has_edge(u, v) {
+                        continue;
+                    }
+
+                    let is_safe = state.is_c4_safe_to_add(u, v);
+                    let delta = state.c4_delta_if_add(u, v);
+
+                    if is_safe {
+                        assert_eq!(
+                            delta, 0,
+                            "is_c4_safe_to_add returned true but delta is {delta}"
+                        );
+                    }
+                    if delta == 0 {
+                        assert!(
+                            is_safe,
+                            "delta is 0 but is_c4_safe_to_add returned false"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c4_safe_non_edges_all_valid() {
+        const N: usize = 10;
+        let mut rng = XorShiftRng::seed_from_u64(0x5AFE2);
+
+        for _ in 0..50 {
+            let state = RamseyState::<N>::new_random(&mut rng, 0.25);
+            let safe_edges = state.c4_safe_non_edges();
+
+            for (u, v) in safe_edges {
+                assert!(!state.has_edge(u, v), "Safe edge ({u}, {v}) already exists");
+                assert!(
+                    state.is_c4_safe_to_add(u, v),
+                    "Edge ({u}, {v}) is not actually safe"
+                );
+                assert_eq!(
+                    state.c4_delta_if_add(u, v),
+                    0,
+                    "Edge ({u}, {v}) would create C4s"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn c4_safe_count_matches_list() {
+        const N: usize = 12;
+        let mut rng = XorShiftRng::seed_from_u64(0xC0047);
+
+        for _ in 0..20 {
+            let state = RamseyState::<N>::new_random(&mut rng, 0.3);
+            let count = state.c4_safe_non_edge_count();
+            let list = state.c4_safe_non_edges();
+            assert_eq!(count, list.len());
+        }
     }
 }

@@ -62,6 +62,9 @@
 //! - [`iset`]: Exact independent-set oracle using branch-and-bound with coloring bounds.
 //! - [`search`]: Parallel stochastic search driver (LAHC + SA hybrid).
 //! - [`validate`]: Deterministic validation of witness graphs.
+//! - [`witness`]: Lazy IS witness pool with coverage-based move selection.
+//! - [`portfolio`]: Heterogeneous parallel search with island model.
+//! - [`lockfree`]: Lock-free data structures and SIMD-optimized operations.
 //!
 //! ## Performance Notes
 //!
@@ -87,15 +90,30 @@
 #![allow(clippy::doc_markdown)] // LaTeX-style notation in docs
 #![allow(clippy::multiple_crate_versions)] // Cargo.lock management is external
 
+pub mod construction;
+pub mod elite;
 pub mod graph;
 pub mod iset;
+pub mod lockfree;
+pub mod moves;
+pub mod portfolio;
+pub mod replica;
 pub mod search;
 pub mod validate;
+pub mod witness;
 
 /// Re-export commonly used types for convenience.
 pub mod prelude {
+    pub use crate::construction::{construct_best_of, construct_initial, ConstructionStrategy};
+    pub use crate::elite::ElitePool;
     pub use crate::graph::{parse_adjacency_matrix, RamseyState};
     pub use crate::iset::IndependentSetOracle;
+    pub use crate::lockfree::{
+        AtomicStats, LockFreeElitePool, LockFreeWitnessPool, WitnessEntry,
+    };
+    pub use crate::moves::{apply_move, CompoundMoveGenerator, MoveType};
+    pub use crate::portfolio::IslandConfig;
     pub use crate::search::{run_record_search, run_search, SearchConfig};
     pub use crate::validate::validate_known_graphs;
+    pub use crate::witness::{SharedWitnessPool, Witness, WitnessPool};
 }

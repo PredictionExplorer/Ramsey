@@ -24,6 +24,8 @@ warnings = "deny"
 rand          = "0.9.2"
 rand_xorshift = "0.4.0"
 rayon         = "1.11.0"
+crossbeam     = "0.8"        # Lock-free data structures
+parking_lot   = "0.12"       # Faster locks where needed
 
 # ============================================================================
 # Optimization Profiles
